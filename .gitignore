@@ -1,0 +1,13 @@
+/target
+*.ipsw
+*.im4p
+*.im4m
+*.img4
+*.dmg
+*.aea
+kernelcache*
+DeviceTree*
+cache/
+ipsw_cache/
+*.img
+.verify_tmp/

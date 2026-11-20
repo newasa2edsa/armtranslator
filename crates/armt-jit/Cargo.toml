@@ -1,0 +1,9 @@
+[package]
+name = "armt-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+armt-core = { workspace = true }
+armt-decoder = { workspace = true }

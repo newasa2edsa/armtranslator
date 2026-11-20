@@ -1,0 +1,19 @@
+[package]
+name = "armt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "armtranslator"
+path = "src/main.rs"
+
+[dependencies]
+armt-core = { workspace = true }
+armt-decoder = { workspace = true }
+armt-jit = { workspace = true }
+armt-apple = { workspace = true }
+armt-hw = { workspace = true }
+armt-vm = { workspace = true }
+clap = { workspace = true }
+minifb = { workspace = true }

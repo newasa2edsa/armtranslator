@@ -1,0 +1,12 @@
+[package]
+name = "armt-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+armt-core = { workspace = true }
+armt-decoder = { workspace = true }
+armt-jit = { workspace = true }
+armt-apple = { workspace = true }
+armt-hw = { workspace = true }

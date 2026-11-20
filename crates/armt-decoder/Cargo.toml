@@ -1,0 +1,8 @@
+[package]
+name = "armt-decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+armt-core = { workspace = true }

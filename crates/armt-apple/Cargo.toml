@@ -1,0 +1,14 @@
+[package]
+name = "armt-apple"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+armt-core = { workspace = true }
+ureq = { workspace = true }
+flate2 = { workspace = true }
+plist = { workspace = true }
+lzfse_rust = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
