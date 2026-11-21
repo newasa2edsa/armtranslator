@@ -20,6 +20,7 @@ const EXIT_WFI: u64 = 6;
 const EXIT_ERET: u64 = 7;
 const EXIT_UNKNOWN: u64 = 8;
 const EXIT_FAULT: u64 = 9;
+const EXIT_IRQ_YIELD: u64 = 11;
 
 #[inline]
 const fn pack_exit(tag: u64, payload: u32) -> u64 {
@@ -85,8 +86,17 @@ unsafe fn vtable_fallback<M: GuestMemory + SysRegBus + ?Sized>(
 ) -> u64 {
     let host = &mut *(host_ptr as *mut HostStateRef<M>);
     let cpu = &mut *cpu_ptr;
+    let prev_daif = cpu.daif;
     match Interpreter::exec_word(cpu, host.mem, host.mmu, pc, word) {
-        Ok(StepOutcome::Continue) => EXIT_CONTINUE,
+        Ok(StepOutcome::Continue) => {
+            // Yield back to the VM loop immediately when IRQ/FIQ becomes unmasked
+            if ((prev_daif & 3) & !(cpu.daif & 3)) != 0 {
+                cpu.pc = pc.wrapping_add(4);
+                EXIT_IRQ_YIELD
+            } else {
+                EXIT_CONTINUE
+            }
+        }
         Ok(StepOutcome::Branch(target)) => {
             cpu.pc = target;
             pack_exit(10, 0) // early branch exit from fallback
@@ -404,6 +414,11 @@ impl JitEngine {
             let payload = (raw_ret >> 8) as u32;
             match tag {
                 EXIT_CONTINUE | 10 => continue,
+                EXIT_IRQ_YIELD => {
+                    self.stats.interp_fallbacks += ctx.interp_fallbacks;
+                    self.stats.insns_executed = cpu.insn_count;
+                    return Ok(StepOutcome::Continue);
+                }
                 EXIT_HLT => {
                     self.stats.interp_fallbacks += ctx.interp_fallbacks;
                     self.stats.insns_executed = cpu.insn_count;
