@@ -306,3 +306,107 @@ fn test_jit_and_interp_irq_fiq_and_daif_transitions() {
     assert_eq!(jit2, [1, 48, 0, 0x3 << 6]);
     assert_eq!(jit2, interp2);
 }
+
+#[test]
+fn test_mmu_pxn_cross_page_va_bounds_and_jit_budget() {
+    use armt_core::isa::{AddrMode, Reg, Width};
+    use armt_core::GuestMemory;
+    use armt_decoder::asm;
+    use armt_hw::{Vma2Bus, Vma2MemMap};
+    use armt_jit::{JitEngine, Mmu, StepOutcome};
+
+    // 1. JIT exact instruction budget: budget=1 on [MOV X0, #42; HLT #0] must stop after 1 insn
+    {
+        let mut bus = Vma2Bus::new(Vma2MemMap::with_ram_mb(16), false);
+        let code_pa = 0x8000_1000u64;
+        bus.write_u32(code_pa, asm::movz_x(Reg(0), 42, 0)).unwrap();
+        bus.write_u32(code_pa + 4, asm::hlt(0)).unwrap();
+        let mut cpu = armt_core::CpuState::new();
+        cpu.pc = code_pa;
+        let mut mmu = Mmu::new();
+        let mut jit = JitEngine::new();
+        let out = jit.run(&mut cpu, &mut bus, &mut mmu, 1).unwrap();
+        assert_eq!(out, StepOutcome::Continue);
+        assert_eq!(cpu.x[0], 42);
+        assert_eq!(cpu.insn_count, 1);
+        assert_eq!(cpu.pc, code_pa + 4);
+    }
+
+    // Helper mapping 4KB pages with T0SZ=28 (36-bit VA):
+    // VA 0x0000_0000 -> PA 0x8004_0000 (code RWX)
+    // VA 0x0000_1000 -> PA 0x8005_0000 (page A RW PXN)
+    // VA 0x0000_2000 -> PA 0x8008_0000 (non-adjacent page B RW PXN)
+    // VA 0x0000_3000 -> PA 0x8006_0000 (PXN page holding MOV+HLT)
+    let setup_mapped_vm = |mode: ExecMode| -> ArmVm {
+        let mut vm = ArmVm::new(
+            Vma2MemMap::with_ram_mb(16),
+            VmConfig {
+                mode,
+                max_steps: 1000,
+                ..Default::default()
+            },
+        );
+        let l1 = 0x8001_0000u64;
+        let l2 = 0x8001_1000u64;
+        let l3 = 0x8001_2000u64;
+        vm.bus.write_u64(l1, l2 | 0x3).unwrap();
+        vm.bus.write_u64(l2, l3 | 0x3).unwrap();
+        vm.bus.write_u64(l3, 0x8004_0000 | 0x403).unwrap();
+        vm.bus.write_u64(l3 + 8, (1u64 << 53) | 0x8005_0000 | 0x403).unwrap();
+        vm.bus.write_u64(l3 + 16, (1u64 << 53) | 0x8008_0000 | 0x403).unwrap();
+        vm.bus.write_u64(l3 + 24, (1u64 << 53) | 0x8006_0000 | 0x403).unwrap();
+        vm.cpu.tcr_el1 = 28;
+        vm.cpu.ttbr0_el1 = l1;
+        vm.cpu.sctlr_el1 |= 1;
+        vm.cpu.pc = 0x0000_0000;
+        vm
+    };
+
+    // 2. PXN execution fault in both JIT and Interpreter
+    for mode in [ExecMode::Interpreter, ExecMode::Jit] {
+        let mut vm = setup_mapped_vm(mode);
+        vm.bus.write_u32(0x8006_0000, asm::hlt(0)).unwrap();
+        vm.cpu.pc = 0x3000;
+        let err = vm.run().unwrap_err();
+        assert!(format!("{err}").contains("Instruction"), "{mode:?} got {err}");
+    }
+
+    // 3. Cross-page LDR and STR in both JIT and Interpreter (not using PA+4!)
+    for mode in [ExecMode::Interpreter, ExecMode::Jit] {
+        let mut vm = setup_mapped_vm(mode);
+        vm.bus.write_u32(0x8005_0FFC, 0x1122_3344).unwrap();
+        vm.bus.write_u32(0x8008_0000, 0x5566_7788).unwrap();
+        vm.bus.write_u32(0x8005_1000, 0xDEAD_BEEF).unwrap(); // must remain untouched!
+
+        let prog = [
+            asm::movz_x(Reg(1), 0x1FFC, 0),
+            asm::ldr_x(Reg(0), Reg(1), AddrMode::UnsignedOffset(0)),
+            asm::movz_x(Reg(2), 0xCAFE, 0),
+            asm::movk_x(Reg(2), 0xBABE, 16),
+            asm::movk_x(Reg(2), 0xBEEF, 32),
+            asm::movk_x(Reg(2), 0xF00D, 48),
+            asm::str_x(Reg(2), Reg(1), AddrMode::UnsignedOffset(0)),
+            asm::hlt(0),
+        ];
+        for (i, w) in prog.iter().enumerate() {
+            vm.bus.write_u32(0x8004_0000 + (i as u64) * 4, *w).unwrap();
+        }
+        let stats = vm.run().unwrap();
+        assert_eq!(stats.exit_reason, "HLT #0");
+        assert_eq!(vm.cpu.x[0], 0x5566_7788_1122_3344);
+        assert_eq!(vm.bus.read_u32(0x8005_0FFC).unwrap(), 0xBABE_CAFE);
+        assert_eq!(vm.bus.read_u32(0x8008_0000).unwrap(), 0xF00D_BEEF);
+        assert_eq!(vm.bus.read_u32(0x8005_1000).unwrap(), 0xDEAD_BEEF);
+    }
+
+    // 4. Out-of-range 36-bit VA load faults rather than aliasing VA 0
+    for mode in [ExecMode::Interpreter, ExecMode::Jit] {
+        let mut vm = setup_mapped_vm(mode);
+        vm.cpu.x[1] = 1u64 << 36;
+        vm.bus
+            .write_u32(0x8004_0000, asm::ldr_x(Reg(0), Reg(1), AddrMode::UnsignedOffset(0)))
+            .unwrap();
+        vm.bus.write_u32(0x8004_0004, asm::hlt(0)).unwrap();
+        assert!(vm.run().is_err(), "{mode:?} allowed out-of-range VA read");
+    }
+}

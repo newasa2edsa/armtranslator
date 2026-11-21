@@ -155,15 +155,12 @@ unsafe fn vtable_mem_read<M: GuestMemory + SysRegBus + ?Sized>(
 ) -> std::result::Result<u64, u64> {
     let host = &mut *(host_ptr as *mut HostStateRef<M>);
     let cpu = &*cpu_ptr;
-    let res = (|| -> Result<u64> {
-        let pa = host.mmu.translate(cpu, host.mem, va, false)?;
-        match size {
-            1 => Ok(host.mem.read_u8(pa)? as u64),
-            2 => Ok(host.mem.read_u16(pa)? as u64),
-            4 => Ok(host.mem.read_u32(pa)? as u64),
-            _ => host.mem.read_u64(pa),
-        }
-    })();
+    let res = match size {
+        1 => host.mmu.read_mem_u8(cpu, host.mem, va).map(|v| v as u64),
+        2 => host.mmu.read_mem_u16(cpu, host.mem, va).map(|v| v as u64),
+        4 => host.mmu.read_mem_u32(cpu, host.mem, va).map(|v| v as u64),
+        _ => host.mmu.read_mem_u64(cpu, host.mem, va),
+    };
     match res {
         Ok(v) => Ok(v),
         Err(e) => {
@@ -182,15 +179,12 @@ unsafe fn vtable_mem_write<M: GuestMemory + SysRegBus + ?Sized>(
 ) -> std::result::Result<(), u64> {
     let host = &mut *(host_ptr as *mut HostStateRef<M>);
     let cpu = &*cpu_ptr;
-    let res = (|| -> Result<()> {
-        let pa = host.mmu.translate(cpu, host.mem, va, true)?;
-        match size {
-            1 => host.mem.write_u8(pa, val as u8),
-            2 => host.mem.write_u16(pa, val as u16),
-            4 => host.mem.write_u32(pa, val as u32),
-            _ => host.mem.write_u64(pa, val),
-        }
-    })();
+    let res = match size {
+        1 => host.mmu.write_mem_u8(cpu, host.mem, va, val as u8),
+        2 => host.mmu.write_mem_u16(cpu, host.mem, va, val as u16),
+        4 => host.mmu.write_mem_u32(cpu, host.mem, va, val as u32),
+        _ => host.mmu.write_mem_u64(cpu, host.mem, va, val),
+    };
     match res {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -283,6 +277,7 @@ struct BlockKey {
     ttbr0: u64,
     ttbr1: u64,
     el: u8,
+    max_insns_cap: u8,
 }
 
 /// High-speed AArch64 -> x86-64 Dynamic Binary Translator (Dynarec JIT).
@@ -365,11 +360,13 @@ impl JitEngine {
                 self.stats.insns_executed = cpu.insn_count;
                 return Ok(StepOutcome::Continue);
             }
-            if cpu.insn_count - start_insns >= max_insns {
+            let remaining = max_insns.saturating_sub(cpu.insn_count - start_insns);
+            if remaining == 0 {
                 self.stats.interp_fallbacks += ctx.interp_fallbacks;
                 self.stats.insns_executed = cpu.insn_count;
                 return Ok(StepOutcome::Continue);
             }
+            let block_cap = remaining.min(MAX_BLOCK_INSNS as u64) as usize;
 
             if ctx.cache_invalidate_pending != 0 {
                 self.cache.clear();
@@ -383,13 +380,14 @@ impl JitEngine {
                 ttbr0: cpu.ttbr0_el1,
                 ttbr1: cpu.ttbr1_el1,
                 el: cpu.el,
+                max_insns_cap: block_cap as u8,
             };
             let entry_fn = if let Some(b) = self.cache.get(&key) {
                 self.stats.jit_hits += 1;
                 b.entry
             } else {
                 self.stats.jit_misses += 1;
-                let block = compile_block(cpu, &mut host_ref, block_pc)?;
+                let block = compile_block(cpu, &mut host_ref, block_pc, block_cap)?;
                 let f = block.entry;
                 self.cache.insert(key, block);
                 self.stats.blocks_compiled += 1;
@@ -486,6 +484,7 @@ fn compile_block<M: GuestMemory + SysRegBus + ?Sized>(
     cpu: &CpuState,
     host: &mut HostStateRef<M>,
     start_pc: u64,
+    max_block_insns: usize,
 ) -> Result<CompiledBlock> {
     let mut e = X64Emitter::new();
     emit_prologue(&mut e);
@@ -494,9 +493,10 @@ fn compile_block<M: GuestMemory + SysRegBus + ?Sized>(
     let mut fault_patches: Vec<(usize, u64, usize)> = Vec::new();
     let mut cur_pc = start_pc;
     let mut compiled_insns = 0usize;
+    let block_limit = max_block_insns.clamp(1, MAX_BLOCK_INSNS);
 
-    for idx in 0..MAX_BLOCK_INSNS {
-        let pa = match host.mmu.translate(cpu, host.mem, cur_pc, false) {
+    for idx in 0..block_limit {
+        let pa = match host.mmu.translate_exec(cpu, host.mem, cur_pc) {
             Ok(p) => p,
             Err(err) => {
                 if idx == 0 {
@@ -528,7 +528,7 @@ fn compile_block<M: GuestMemory + SysRegBus + ?Sized>(
         if is_term {
             break;
         }
-        if idx + 1 == MAX_BLOCK_INSNS {
+        if idx + 1 == block_limit {
             // End of block budget without branch: advance PC & insn_count and exit cleanly
             emit_add_insn_count(&mut e, compiled_insns);
             e.mov64_imm(Gpr::Rax, cur_pc);

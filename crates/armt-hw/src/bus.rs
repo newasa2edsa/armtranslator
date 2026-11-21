@@ -188,10 +188,24 @@ impl Vma2Bus {
             return self.bdif.write(addr - m.bdif_base, size, val);
         }
         if addr >= m.aes1_base && addr < m.aes1_base + m.aes1_size {
-            return self.aes1.write(addr - m.aes1_base, size, val);
+            let off = addr - m.aes1_base;
+            let res = self.aes1.write_with_dma(off, size, val, &mut self.ram, m.ram_base);
+            if self.aes1.irq_pending() || self.aes2.irq_pending() {
+                self.gic.raise_irq(50);
+            } else {
+                self.gic.clear_irq(50);
+            }
+            return res;
         }
         if addr >= m.aes2_base && addr < m.aes2_base + m.aes2_size {
-            return self.aes2.write(addr - m.aes2_base, size, val);
+            let off = addr - m.aes2_base;
+            let res = self.aes2.write_with_dma(off, size, val, &mut self.ram, m.ram_base);
+            if self.aes1.irq_pending() || self.aes2.irq_pending() {
+                self.gic.raise_irq(50);
+            } else {
+                self.gic.clear_irq(50);
+            }
+            return res;
         }
         if addr >= m.cfg_base && addr < m.cfg_base + m.cfg_size {
             return self.cfg.write(addr - m.cfg_base, size, val);

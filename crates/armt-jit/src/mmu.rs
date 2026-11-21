@@ -2,6 +2,14 @@ use armt_core::{ArmtError, CpuState, GuestMemory, Result};
 
 const TLB_SIZE: usize = 256;
 
+/// Memory access type for Stage-1 MMU translation and permission checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemAccess {
+    Read,
+    Write,
+    Execute,
+}
+
 #[derive(Clone, Copy, Default)]
 struct TlbEntry {
     tag: u64,
@@ -9,6 +17,8 @@ struct TlbEntry {
     page_mask: u64,
     ap_el0: bool,
     ap_ro: bool,
+    pxn: bool,
+    uxn: bool,
     level: u8,
     valid: bool,
 }
@@ -44,7 +54,7 @@ impl Mmu {
         self.tlb[idx16].valid = false;
     }
 
-    /// Translate guest VA -> PA using `TTBR0_EL1`/`TTBR1_EL1` and `TCR_EL1`.
+    /// Translate guest VA -> PA using `TTBR0_EL1`/`TTBR1_EL1` and `TCR_EL1` for data reads/writes.
     pub fn translate<M: GuestMemory + ?Sized>(
         &mut self,
         cpu: &CpuState,
@@ -52,12 +62,238 @@ impl Mmu {
         va: u64,
         is_write: bool,
     ) -> Result<u64> {
+        let access = if is_write {
+            MemAccess::Write
+        } else {
+            MemAccess::Read
+        };
+        self.translate_access(cpu, mem, va, access)
+    }
+
+    /// Translate guest VA -> PA for instruction fetch (enforces `PXN`/`UXN`/`WXN`).
+    pub fn translate_exec<M: GuestMemory + ?Sized>(
+        &mut self,
+        cpu: &CpuState,
+        mem: &mut M,
+        va: u64,
+    ) -> Result<u64> {
+        self.translate_access(cpu, mem, va, MemAccess::Execute)
+    }
+
+    #[inline]
+    fn granule_mask(cpu: &CpuState, va: u64) -> u64 {
+        if !cpu.mmu_enabled() {
+            return 0xFFF;
+        }
+        let upper = ((va >> 55) & 1) != 0;
+        let shift = if upper {
+            match (cpu.tcr_el1 >> 30) & 3 {
+                1 => 14u32,
+                2 => 12u32,
+                3 => 16u32,
+                _ => 14u32,
+            }
+        } else {
+            match (cpu.tcr_el1 >> 14) & 3 {
+                0 => 12u32,
+                2 => 14u32,
+                1 => 16u32,
+                _ => 12u32,
+            }
+        };
+        (1u64 << shift) - 1
+    }
+
+    /// Cross-page-safe virtual-memory read of `N` (1, 2, 4, or 8) little-endian bytes.
+    #[inline]
+    fn read_mem_bytes<const N: usize, M: GuestMemory + ?Sized>(
+        &mut self,
+        cpu: &CpuState,
+        mem: &mut M,
+        va: u64,
+    ) -> Result<[u8; N]> {
+        let page_mask = Self::granule_mask(cpu, va);
+        let end_va = va.wrapping_add((N - 1) as u64);
+        let same_page = !cpu.mmu_enabled()
+            || (N == 1)
+            || ((va & !page_mask) == (end_va & !page_mask) && va <= end_va);
+        if same_page {
+            let pa = self.translate_access(cpu, mem, va, MemAccess::Read)?;
+            let mut out = [0u8; N];
+            match N {
+                1 => out[0] = mem.read_u8(pa)?,
+                2 => out.copy_from_slice(&mem.read_u16(pa)?.to_le_bytes()),
+                4 => out.copy_from_slice(&mem.read_u32(pa)?.to_le_bytes()),
+                8 => out.copy_from_slice(&mem.read_u64(pa)?.to_le_bytes()),
+                _ => unreachable!(),
+            }
+            return Ok(out);
+        }
+
+        let split = ((page_mask + 1) - (va & page_mask)) as usize;
+        let pa1 = self.translate_access(cpu, mem, va, MemAccess::Read)?;
+        let pa2 = self.translate_access(cpu, mem, va.wrapping_add(split as u64), MemAccess::Read)?;
+        let mut out = [0u8; N];
+        for i in 0..split {
+            out[i] = mem.read_u8(pa1.wrapping_add(i as u64))?;
+        }
+        for i in split..N {
+            out[i] = mem.read_u8(pa2.wrapping_add((i - split) as u64))?;
+        }
+        Ok(out)
+    }
+
+    /// Cross-page-safe virtual-memory write of `N` (1, 2, 4, or 8) little-endian bytes.
+    /// Translates all touched pages before mutating memory on a fault.
+    #[inline]
+    fn write_mem_bytes<const N: usize, M: GuestMemory + ?Sized>(
+        &mut self,
+        cpu: &CpuState,
+        mem: &mut M,
+        va: u64,
+        bytes: [u8; N],
+    ) -> Result<()> {
+        let page_mask = Self::granule_mask(cpu, va);
+        let end_va = va.wrapping_add((N - 1) as u64);
+        let same_page = !cpu.mmu_enabled()
+            || (N == 1)
+            || ((va & !page_mask) == (end_va & !page_mask) && va <= end_va);
+        if same_page {
+            let pa = self.translate_access(cpu, mem, va, MemAccess::Write)?;
+            return match N {
+                1 => mem.write_u8(pa, bytes[0]),
+                2 => mem.write_u16(pa, u16::from_le_bytes([bytes[0], bytes[1]])),
+                4 => mem.write_u32(pa, u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+                8 => mem.write_u64(
+                    pa,
+                    u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]),
+                ),
+                _ => unreachable!(),
+            };
+        }
+
+        let split = ((page_mask + 1) - (va & page_mask)) as usize;
+        let pa1 = self.translate_access(cpu, mem, va, MemAccess::Write)?;
+        let pa2 =
+            self.translate_access(cpu, mem, va.wrapping_add(split as u64), MemAccess::Write)?;
+        for i in 0..split {
+            mem.write_u8(pa1.wrapping_add(i as u64), bytes[i])?;
+        }
+        for i in split..N {
+            mem.write_u8(pa2.wrapping_add((i - split) as u64), bytes[i])?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn read_mem_u8<M: GuestMemory + ?Sized>(&mut self, cpu: &CpuState, mem: &mut M, va: u64) -> Result<u8> {
+        Ok(self.read_mem_bytes::<1, M>(cpu, mem, va)?[0])
+    }
+
+    #[inline]
+    pub fn read_mem_u16<M: GuestMemory + ?Sized>(&mut self, cpu: &CpuState, mem: &mut M, va: u64) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.read_mem_bytes::<2, M>(cpu, mem, va)?))
+    }
+
+    #[inline]
+    pub fn read_mem_u32<M: GuestMemory + ?Sized>(&mut self, cpu: &CpuState, mem: &mut M, va: u64) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.read_mem_bytes::<4, M>(cpu, mem, va)?))
+    }
+
+    #[inline]
+    pub fn read_mem_u64<M: GuestMemory + ?Sized>(&mut self, cpu: &CpuState, mem: &mut M, va: u64) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.read_mem_bytes::<8, M>(cpu, mem, va)?))
+    }
+
+    #[inline]
+    pub fn write_mem_u8<M: GuestMemory + ?Sized>(&mut self, cpu: &CpuState, mem: &mut M, va: u64, v: u8) -> Result<()> {
+        self.write_mem_bytes::<1, M>(cpu, mem, va, [v])
+    }
+
+    #[inline]
+    pub fn write_mem_u16<M: GuestMemory + ?Sized>(&mut self, cpu: &CpuState, mem: &mut M, va: u64, v: u16) -> Result<()> {
+        self.write_mem_bytes::<2, M>(cpu, mem, va, v.to_le_bytes())
+    }
+
+    #[inline]
+    pub fn write_mem_u32<M: GuestMemory + ?Sized>(&mut self, cpu: &CpuState, mem: &mut M, va: u64, v: u32) -> Result<()> {
+        self.write_mem_bytes::<4, M>(cpu, mem, va, v.to_le_bytes())
+    }
+
+    #[inline]
+    pub fn write_mem_u64<M: GuestMemory + ?Sized>(&mut self, cpu: &CpuState, mem: &mut M, va: u64, v: u64) -> Result<()> {
+        self.write_mem_bytes::<8, M>(cpu, mem, va, v.to_le_bytes())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn check_permissions(
+        cpu: &CpuState,
+        va: u64,
+        access: MemAccess,
+        ap_el0: bool,
+        ap_ro: bool,
+        pxn: bool,
+        uxn: bool,
+        level: u8,
+    ) -> Result<()> {
+        let prefix = if access == MemAccess::Execute {
+            "Instruction "
+        } else {
+            ""
+        };
+        let wr_bit = if access == MemAccess::Write { 0x40 } else { 0 };
+        if cpu.el == 0 && !ap_el0 {
+            return Err(ArmtError::MmuFault {
+                va,
+                iss: wr_bit + 0x0C + (level as u32),
+                reason: format!("{prefix}Permission fault (EL0 access denied)"),
+            });
+        }
+        if access == MemAccess::Write && ap_ro {
+            return Err(ArmtError::MmuFault {
+                va,
+                iss: 0x4C + (level as u32),
+                reason: "Permission fault (write to read-only page)".into(),
+            });
+        }
+        if access == MemAccess::Execute {
+            let wxn = ((cpu.sctlr_el1 >> 19) & 1) != 0 && !ap_ro;
+            let no_exec = if cpu.el == 0 {
+                uxn || wxn
+            } else {
+                pxn || wxn || (ap_el0 && !ap_ro)
+            };
+            if no_exec {
+                return Err(ArmtError::MmuFault {
+                    va,
+                    iss: 0x0C + (level as u32),
+                    reason: format!(
+                        "Instruction permission fault (execute-never: pxn={pxn}, uxn={uxn}, wxn={wxn})"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Translate guest VA -> PA for an explicit `MemAccess` kind.
+    pub fn translate_access<M: GuestMemory + ?Sized>(
+        &mut self,
+        cpu: &CpuState,
+        mem: &mut M,
+        va: u64,
+        access: MemAccess,
+    ) -> Result<u64> {
         if !cpu.mmu_enabled() {
             return Ok(va);
         }
 
         let upper = ((va >> 55) & 1) != 0;
-        let (ttbr, tsz, granule_shift) = if upper {
+        let (ttbr, tsz, granule_shift, tbi) = if upper {
             let t1sz = ((cpu.tcr_el1 >> 16) & 0x3F) as u32;
             let tg1 = (cpu.tcr_el1 >> 30) & 3;
             let shift = match tg1 {
@@ -66,7 +302,8 @@ impl Mmu {
                 3 => 16u32, // 64 KB
                 _ => 14u32,
             };
-            (cpu.ttbr1_el1, t1sz, shift)
+            let tbi1 = ((cpu.tcr_el1 >> 38) & 1) != 0;
+            (cpu.ttbr1_el1, t1sz, shift, tbi1)
         } else {
             let t0sz = (cpu.tcr_el1 & 0x3F) as u32;
             let tg0 = (cpu.tcr_el1 >> 14) & 3;
@@ -76,8 +313,41 @@ impl Mmu {
                 1 => 16u32, // 64 KB
                 _ => 12u32,
             };
-            (cpu.ttbr0_el1, t0sz, shift)
+            let tbi0 = ((cpu.tcr_el1 >> 37) & 1) != 0;
+            (cpu.ttbr0_el1, t0sz, shift, tbi0)
         };
+
+        let va_bits = 64u32.saturating_sub(tsz);
+        let fault_prefix = if access == MemAccess::Execute {
+            "Instruction "
+        } else {
+            ""
+        };
+        let wr_bit = if access == MemAccess::Write { 0x40 } else { 0 };
+        if va_bits < granule_shift || ttbr == 0 {
+            return Err(ArmtError::MmuFault {
+                va,
+                iss: wr_bit + 0x04,
+                reason: format!("{fault_prefix}Invalid TCR or TTBR=0 during MMU walk"),
+            });
+        }
+        if va_bits < 64 {
+            let top_mask = if tbi && va_bits < 56 {
+                ((1u64 << (56 - va_bits)) - 1) << va_bits
+            } else {
+                u64::MAX << va_bits
+            };
+            let expected = if upper { top_mask } else { 0 };
+            if (va & top_mask) != expected {
+                return Err(ArmtError::MmuFault {
+                    va,
+                    iss: wr_bit + 0x04,
+                    reason: format!(
+                        "{fault_prefix}Translation fault (VA 0x{va:016x} out of {va_bits}-bit range)"
+                    ),
+                });
+            }
+        }
 
         let page_size = 1u64 << granule_shift;
         let page_mask = page_size - 1;
@@ -87,34 +357,21 @@ impl Mmu {
 
         let cached = self.tlb[tlb_idx];
         if cached.valid && cached.tag == tag && cached.page_mask == page_mask {
-            if cpu.el == 0 && !cached.ap_el0 {
-                return Err(ArmtError::MmuFault {
-                    va,
-                    iss: (if is_write { 0x4C } else { 0x0C }) + (cached.level as u32),
-                    reason: "Permission fault (EL0 access denied)".into(),
-                });
-            }
-            if is_write && cached.ap_ro {
-                return Err(ArmtError::MmuFault {
-                    va,
-                    iss: 0x4C + (cached.level as u32),
-                    reason: "Permission fault (write to read-only page)".into(),
-                });
-            }
+            Self::check_permissions(
+                cpu,
+                va,
+                access,
+                cached.ap_el0,
+                cached.ap_ro,
+                cached.pxn,
+                cached.uxn,
+                cached.level,
+            )?;
             return Ok(cached.pa_base | (va & page_mask));
         }
 
-        let stride = granule_shift - 3; // 9 bits for 4KB, 11 bits for 16KB
-        let va_bits = 64u32.saturating_sub(tsz);
-        if va_bits < granule_shift || ttbr == 0 {
-            return Err(ArmtError::MmuFault {
-                va,
-                iss: if is_write { 0x44 } else { 0x04 },
-                reason: "Invalid TCR or TTBR=0 during MMU walk".into(),
-            });
-        }
-
         // Compute starting lookup level from VA width and granule stride
+        let stride = granule_shift - 3; // 9 bits for 4KB, 11 bits for 16KB
         let resolved_bits = va_bits - granule_shift;
         let num_levels = resolved_bits.div_ceil(stride).clamp(1, 4);
         let start_level = 4 - num_levels;
@@ -128,6 +385,8 @@ impl Mmu {
         let oa_mask = 0x0000_FFFF_FFFF_FFFFu64 & !page_mask;
         let mut table_ap_ro = false;
         let mut table_ap_deny_el0 = false;
+        let mut table_pxn = false;
+        let mut table_uxn = false;
 
         for level in start_level..=3 {
             let lsb = granule_shift + (3 - level) * stride;
@@ -145,16 +404,18 @@ impl Mmu {
             let desc_addr = table_addr + index * 8;
             let desc = mem.read_u64(desc_addr).map_err(|_| ArmtError::MmuFault {
                 va,
-                iss: (if is_write { 0x44 } else { 0x04 }) + (level as u32),
-                reason: format!("Page table read fault at PA=0x{desc_addr:x}"),
+                iss: wr_bit + 0x04 + (level as u32),
+                reason: format!("{fault_prefix}Page table read fault at PA=0x{desc_addr:x}"),
             })?;
 
             let kind = desc & 0x3;
             if kind == 0 || (kind == 2) {
                 return Err(ArmtError::MmuFault {
                     va,
-                    iss: (if is_write { 0x44 } else { 0x04 }) + (level as u32),
-                    reason: format!("Translation fault at level {level} (desc=0x{desc:x})"),
+                    iss: wr_bit + 0x04 + (level as u32),
+                    reason: format!(
+                        "{fault_prefix}Translation fault at level {level} (desc=0x{desc:x})"
+                    ),
                 });
             }
 
@@ -162,6 +423,8 @@ impl Mmu {
             if (level < 3 && kind == 1) || (level == 3 && kind == 3) {
                 let ap_ro = table_ap_ro || ((desc >> 7) & 1) != 0;
                 let ap_el0 = !table_ap_deny_el0 && ((desc >> 6) & 1) != 0;
+                let pxn = table_pxn || ((desc >> 53) & 1) != 0;
+                let uxn = table_uxn || ((desc >> 54) & 1) != 0;
                 let block_mask = (1u64 << lsb) - 1;
                 let oa_base = desc & oa_mask & !block_mask;
                 let pa = oa_base | (va & block_mask);
@@ -172,40 +435,44 @@ impl Mmu {
                     page_mask,
                     ap_el0,
                     ap_ro,
+                    pxn,
+                    uxn,
                     level: level as u8,
                     valid: true,
                 };
-                if cpu.el == 0 && !ap_el0 {
-                    return Err(ArmtError::MmuFault {
-                        va,
-                        iss: (if is_write { 0x4C } else { 0x0C }) + (level as u32),
-                        reason: "Permission fault (EL0 access denied)".into(),
-                    });
-                }
-                if is_write && ap_ro {
-                    return Err(ArmtError::MmuFault {
-                        va,
-                        iss: 0x4C + (level as u32),
-                        reason: "Permission fault (write to read-only page)".into(),
-                    });
-                }
+                Self::check_permissions(
+                    cpu,
+                    va,
+                    access,
+                    ap_el0,
+                    ap_ro,
+                    pxn,
+                    uxn,
+                    level as u8,
+                )?;
                 return Ok(pa);
             }
 
-            // Table descriptor -> propagate APTable restrictions & advance
+            // Table descriptor -> propagate APTable/PXNTable/UXNTable restrictions & advance
             if ((desc >> 62) & 1) != 0 {
                 table_ap_ro = true;
             }
             if ((desc >> 61) & 1) != 0 {
                 table_ap_deny_el0 = true;
             }
+            if ((desc >> 59) & 1) != 0 {
+                table_pxn = true;
+            }
+            if ((desc >> 60) & 1) != 0 {
+                table_uxn = true;
+            }
             table_addr = desc & oa_mask;
         }
 
         Err(ArmtError::MmuFault {
             va,
-            iss: 0x04,
-            reason: "MMU walk exhausted levels".into(),
+            iss: wr_bit + 0x04,
+            reason: format!("{fault_prefix}MMU walk exhausted levels"),
         })
     }
 
@@ -405,5 +672,56 @@ mod tests {
         assert_eq!(cpu.el, 0);
         assert_eq!(cpu.pc, 0x1_0000_4004);
         assert_eq!(cpu.sp, 0x7000_1000);
+    }
+
+    #[test]
+    fn test_pxn_uxn_va_range_and_cross_page_helpers() {
+        let mut ram = FlatRam(vec![0u8; 512 * 1024]);
+        let mut cpu = CpuState::new();
+        cpu.sctlr_el1 |= 1;
+        cpu.tcr_el1 = 28; // T0SZ=28 (36-bit VA, 4KB granule, TBI0=0)
+        cpu.ttbr0_el1 = 0x10000;
+        cpu.el = 1;
+
+        // L1[0] -> L2 at 0x11000 -> L3 at 0x12000
+        ram.write_u64(0x10000, 0x11000 | 0x3).unwrap();
+        ram.write_u64(0x11000, 0x12000 | 0x3).unwrap();
+        // VA 0x0000_0000: PA 0x20000, RW, PXN (bit 53)
+        ram.write_u64(0x12000, (1u64 << 53) | 0x20000 | 0x403).unwrap();
+        // VA 0x0000_1000: non-contiguous PA 0x30000, RO (AP[2]=1 bit 7), UXN (bit 54) + EL0 (bit 6)
+        ram.write_u64(0x12008, (1u64 << 54) | 0x30000 | 0x4C3).unwrap();
+
+        let mut mmu = Mmu::new();
+        // Data read works on PXN page, but instruction fetch (translate_exec) must fault!
+        assert_eq!(mmu.translate(&cpu, &mut ram, 0x100, false).unwrap(), 0x20100);
+        let exec_err = mmu.translate_exec(&cpu, &mut ram, 0x100).unwrap_err();
+        assert!(format!("{exec_err}").contains("Instruction"));
+
+        // UXN at EL0 must fault on execute while EL1 can execute if !PXN
+        cpu.el = 0;
+        assert!(mmu.translate_exec(&cpu, &mut ram, 0x1100).is_err());
+        cpu.el = 1;
+        assert_eq!(mmu.translate_exec(&cpu, &mut ram, 0x1100).unwrap(), 0x30100);
+
+        // Out-of-range 36-bit VA must NOT alias VA 0x0!
+        assert!(mmu.translate(&cpu, &mut ram, 1u64 << 36, false).is_err());
+        assert!(mmu.translate(&cpu, &mut ram, 0x8000_0000_0000_0000, false).is_err());
+        // With TBI0=1, bits [63:56] are ignored, while bit 36 still faults
+        cpu.tcr_el1 |= 1u64 << 37;
+        assert_eq!(mmu.translate(&cpu, &mut ram, 0xAB00_0000_0000_0100, false).unwrap(), 0x20100);
+        assert!(mmu.translate(&cpu, &mut ram, 0xAB00_0010_0000_0100, false).is_err());
+
+        // Cross-page read & fault-atomic write across VA 0xFFC (PA 0x20FFC) -> VA 0x1000 (RO PA 0x30000)
+        cpu.tcr_el1 = 28;
+        ram.write_u32(0x20FFC, 0x1122_3344).unwrap();
+        ram.write_u32(0x30000, 0x5566_7788).unwrap();
+        ram.write_u32(0x21000, 0xDEAD_BEEF).unwrap(); // sentinel right after PA page 1
+        assert_eq!(
+            mmu.read_mem_u64(&cpu, &mut ram, 0x0FFC).unwrap(),
+            0x5566_7788_1122_3344
+        );
+        // Write crossing into RO second page must fault AND must NOT overwrite 0x20FFC!
+        assert!(mmu.write_mem_u64(&cpu, &mut ram, 0x0FFC, 0xAABB_CCDD_EEFF_0011).is_err());
+        assert_eq!(ram.read_u32(0x20FFC).unwrap(), 0x1122_3344);
     }
 }

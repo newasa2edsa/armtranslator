@@ -439,7 +439,7 @@ impl ArmVm {
                                 );
                                 break;
                             }
-                            let is_iabt = (iss & 0x40) == 0 && va == self.cpu.pc;
+                            let is_iabt = reason.starts_with("Instruction ");
                             let ec = match (is_iabt, self.cpu.el) {
                                 (true, 0) => 0x20,
                                 (true, _) => 0x21,
@@ -508,7 +508,7 @@ impl ArmVm {
                                     "  [trace MMU_FAULT] pc=0x{:016x} va=0x{va:016x} iss=0x{iss:08x}: {reason}",
                                     self.cpu.pc
                                 );
-                                let is_iabt = (iss & 0x40) == 0 && va == self.cpu.pc;
+                                let is_iabt = reason.starts_with("Instruction ");
                                 let ec = match (is_iabt, self.cpu.el) {
                                     (true, 0) => 0x20,
                                     (true, _) => 0x21,
@@ -756,7 +756,7 @@ impl ArmVm {
                                 );
                                 break;
                             }
-                            let is_iabt = (iss & 0x40) == 0 && va == self.cpu.pc;
+                            let is_iabt = reason.starts_with("Instruction ");
                             let ec = match (is_iabt, self.cpu.el) {
                                 (true, 0) => 0x20,
                                 (true, _) => 0x21,

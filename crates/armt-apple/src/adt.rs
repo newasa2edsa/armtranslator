@@ -179,7 +179,22 @@ pub fn dump_adt(node: &AdtNode, max_depth: usize) -> String {
         ));
         if matches!(
             node.name.as_str(),
-            "chosen" | "memory-map" | "iBoot" | "options" | "defaults" | "vram" | "pram" | "gic" | "gfx" | "iosurface-mapper"
+            "chosen"
+                | "memory-map"
+                | "iBoot"
+                | "options"
+                | "defaults"
+                | "vram"
+                | "pram"
+                | "gic"
+                | "gfx"
+                | "iosurface-mapper"
+                | "aes"
+                | "uart0"
+                | "avp-rtc"
+                | "avp-ctrr"
+                | "pcie"
+                | "pl061-buttons"
         ) {
             for prop in &node.properties {
                 if prop.name == "name" || prop.name == "compatible" {

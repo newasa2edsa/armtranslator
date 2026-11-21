@@ -158,7 +158,7 @@ impl Interpreter {
         mmu: &mut Mmu,
     ) -> Result<StepOutcome> {
         let pc = cpu.pc;
-        let pa = mmu.translate(cpu, mem, pc, false)?;
+        let pa = mmu.translate_exec(cpu, mem, pc)?;
         let word = mem.read_u32(pa)?;
         let outcome = Self::exec_word(cpu, mem, mmu, pc, word)?;
         match outcome {
@@ -898,10 +898,9 @@ impl Interpreter {
             // --- Loads & Stores ---
             Instruction::Ldr { w, rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
                 let val = match w {
-                    Width::W32 => mem.read_u32(pa)? as u64,
-                    Width::X64 => mem.read_u64(pa)?,
+                    Width::W32 => mmu.read_mem_u32(cpu, mem, ea)? as u64,
+                    Width::X64 => mmu.read_mem_u64(cpu, mem, ea)?,
                 };
                 cpu.write_x(rt, val);
                 if let Some(new_rn) = wb {
@@ -911,10 +910,9 @@ impl Interpreter {
             }
             Instruction::Str { w, rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
                 match w {
-                    Width::W32 => mem.write_u32(pa, cpu.read_w(rt))?,
-                    Width::X64 => mem.write_u64(pa, cpu.read_x(rt))?,
+                    Width::W32 => mmu.write_mem_u32(cpu, mem, ea, cpu.read_w(rt))?,
+                    Width::X64 => mmu.write_mem_u64(cpu, mem, ea, cpu.read_x(rt))?,
                 }
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
@@ -923,8 +921,7 @@ impl Interpreter {
             }
             Instruction::Ldrb { rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
-                cpu.write_x(rt, mem.read_u8(pa)? as u64);
+                cpu.write_x(rt, mmu.read_mem_u8(cpu, mem, ea)? as u64);
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
                 }
@@ -932,8 +929,7 @@ impl Interpreter {
             }
             Instruction::Strb { rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
-                mem.write_u8(pa, cpu.read_x(rt) as u8)?;
+                mmu.write_mem_u8(cpu, mem, ea, cpu.read_x(rt) as u8)?;
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
                 }
@@ -941,8 +937,7 @@ impl Interpreter {
             }
             Instruction::Ldrh { rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
-                cpu.write_x(rt, mem.read_u16(pa)? as u64);
+                cpu.write_x(rt, mmu.read_mem_u16(cpu, mem, ea)? as u64);
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
                 }
@@ -950,8 +945,7 @@ impl Interpreter {
             }
             Instruction::Strh { rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
-                mem.write_u16(pa, cpu.read_x(rt) as u16)?;
+                mmu.write_mem_u16(cpu, mem, ea, cpu.read_x(rt) as u16)?;
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
                 }
@@ -959,8 +953,7 @@ impl Interpreter {
             }
             Instruction::Ldrsb { w, rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
-                let b = mem.read_u8(pa)? as i8 as i64 as u64;
+                let b = mmu.read_mem_u8(cpu, mem, ea)? as i8 as i64 as u64;
                 cpu.write_x(rt, b & w.mask());
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
@@ -969,8 +962,7 @@ impl Interpreter {
             }
             Instruction::Ldrsh { w, rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
-                let h = mem.read_u16(pa)? as i16 as i64 as u64;
+                let h = mmu.read_mem_u16(cpu, mem, ea)? as i16 as i64 as u64;
                 cpu.write_x(rt, h & w.mask());
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
@@ -979,8 +971,7 @@ impl Interpreter {
             }
             Instruction::Ldrsw { rt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
-                let v = mem.read_u32(pa)? as i32 as i64 as u64;
+                let v = mmu.read_mem_u32(cpu, mem, ea)? as i32 as i64 as u64;
                 cpu.write_x(rt, v);
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
@@ -994,12 +985,11 @@ impl Interpreter {
                 signed,
             } => {
                 let ea = (pc as i64).wrapping_add(offset) as u64;
-                let pa = mmu.translate(cpu, mem, ea, false)?;
                 let val = match (w, signed) {
-                    (Width::W32, false) => mem.read_u32(pa)? as u64,
-                    (Width::X64, true) => mem.read_u32(pa)? as i32 as i64 as u64,
-                    (Width::X64, false) => mem.read_u64(pa)?,
-                    _ => mem.read_u32(pa)? as u64,
+                    (Width::W32, false) => mmu.read_mem_u32(cpu, mem, ea)? as u64,
+                    (Width::X64, true) => mmu.read_mem_u32(cpu, mem, ea)? as i32 as i64 as u64,
+                    (Width::X64, false) => mmu.read_mem_u64(cpu, mem, ea)?,
+                    _ => mmu.read_mem_u32(cpu, mem, ea)? as u64,
                 };
                 cpu.write_x(rt, val);
                 Ok(StepOutcome::Continue)
@@ -1012,15 +1002,20 @@ impl Interpreter {
                 mode,
             } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa1 = mmu.translate(cpu, mem, ea, false)?;
                 let stride = match w {
                     Width::W32 => 4u64,
                     Width::X64 => 8u64,
                 };
-                let pa2 = mmu.translate(cpu, mem, ea + stride, false)?;
+                let ea2 = ea.wrapping_add(stride);
                 let (v1, v2) = match w {
-                    Width::W32 => (mem.read_u32(pa1)? as u64, mem.read_u32(pa2)? as u64),
-                    Width::X64 => (mem.read_u64(pa1)?, mem.read_u64(pa2)?),
+                    Width::W32 => (
+                        mmu.read_mem_u32(cpu, mem, ea)? as u64,
+                        mmu.read_mem_u32(cpu, mem, ea2)? as u64,
+                    ),
+                    Width::X64 => (
+                        mmu.read_mem_u64(cpu, mem, ea)?,
+                        mmu.read_mem_u64(cpu, mem, ea2)?,
+                    ),
                 };
                 cpu.write_x(rt, v1);
                 cpu.write_x(rt2, v2);
@@ -1037,20 +1032,19 @@ impl Interpreter {
                 mode,
             } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa1 = mmu.translate(cpu, mem, ea, true)?;
                 let stride = match w {
                     Width::W32 => 4u64,
                     Width::X64 => 8u64,
                 };
-                let pa2 = mmu.translate(cpu, mem, ea + stride, true)?;
+                let ea2 = ea.wrapping_add(stride);
                 match w {
                     Width::W32 => {
-                        mem.write_u32(pa1, cpu.read_w(rt))?;
-                        mem.write_u32(pa2, cpu.read_w(rt2))?;
+                        mmu.write_mem_u32(cpu, mem, ea, cpu.read_w(rt))?;
+                        mmu.write_mem_u32(cpu, mem, ea2, cpu.read_w(rt2))?;
                     }
                     Width::X64 => {
-                        mem.write_u64(pa1, cpu.read_x(rt))?;
-                        mem.write_u64(pa2, cpu.read_x(rt2))?;
+                        mmu.write_mem_u64(cpu, mem, ea, cpu.read_x(rt))?;
+                        mmu.write_mem_u64(cpu, mem, ea2, cpu.read_x(rt2))?;
                     }
                 }
                 if let Some(new_rn) = wb {
@@ -1060,10 +1054,10 @@ impl Interpreter {
             }
             Instruction::Ldpsw { rt, rt2, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa1 = mmu.translate(cpu, mem, ea, false)?;
-                let pa2 = mmu.translate(cpu, mem, ea + 4, false)?;
-                cpu.write_x(rt, mem.read_u32(pa1)? as i32 as i64 as u64);
-                cpu.write_x(rt2, mem.read_u32(pa2)? as i32 as i64 as u64);
+                let v1 = mmu.read_mem_u32(cpu, mem, ea)? as i32 as i64 as u64;
+                let v2 = mmu.read_mem_u32(cpu, mem, ea.wrapping_add(4))? as i32 as i64 as u64;
+                cpu.write_x(rt, v1);
+                cpu.write_x(rt2, v2);
                 if let Some(new_rn) = wb {
                     cpu.write_sp_or_x(rn, new_rn);
                 }
@@ -1071,8 +1065,7 @@ impl Interpreter {
             }
             Instruction::Ldxr { size, rt, rn, .. } => {
                 let ea = cpu.read_sp_or_x(rn);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
-                let val = read_sized(mem, pa, size)?;
+                let val = read_sized_va(mmu, cpu, mem, ea, size)?;
                 cpu.write_x(rt, val);
                 cpu.exclusive_addr = ea;
                 cpu.exclusive_valid = 1;
@@ -1083,8 +1076,7 @@ impl Interpreter {
             } => {
                 let ea = cpu.read_sp_or_x(rn);
                 if cpu.exclusive_valid != 0 && cpu.exclusive_addr == ea {
-                    let pa = mmu.translate(cpu, mem, ea, true)?;
-                    write_sized(mem, pa, size, cpu.read_x(rt))?;
+                    write_sized_va(mmu, cpu, mem, ea, size, cpu.read_x(rt))?;
                     cpu.exclusive_valid = 0;
                     cpu.write_w(rs, 0);
                 } else {
@@ -1098,12 +1090,16 @@ impl Interpreter {
             } => {
                 let ea = cpu.read_sp_or_x(rn);
                 let stride = if is_64 { 8 } else { 4 };
-                let pa1 = mmu.translate(cpu, mem, ea, false)?;
-                let pa2 = mmu.translate(cpu, mem, ea + stride, false)?;
                 let (v1, v2) = if is_64 {
-                    (mem.read_u64(pa1)?, mem.read_u64(pa2)?)
+                    (
+                        mmu.read_mem_u64(cpu, mem, ea)?,
+                        mmu.read_mem_u64(cpu, mem, ea.wrapping_add(stride))?,
+                    )
                 } else {
-                    (mem.read_u32(pa1)? as u64, mem.read_u32(pa2)? as u64)
+                    (
+                        mmu.read_mem_u32(cpu, mem, ea)? as u64,
+                        mmu.read_mem_u32(cpu, mem, ea.wrapping_add(stride))? as u64,
+                    )
                 };
                 cpu.write_x(rt, v1);
                 cpu.write_x(rt2, v2);
@@ -1122,14 +1118,12 @@ impl Interpreter {
                 let ea = cpu.read_sp_or_x(rn);
                 let stride = if is_64 { 8 } else { 4 };
                 if cpu.exclusive_valid != 0 && cpu.exclusive_addr == ea {
-                    let pa1 = mmu.translate(cpu, mem, ea, true)?;
-                    let pa2 = mmu.translate(cpu, mem, ea + stride, true)?;
                     if is_64 {
-                        mem.write_u64(pa1, cpu.read_x(rt))?;
-                        mem.write_u64(pa2, cpu.read_x(rt2))?;
+                        mmu.write_mem_u64(cpu, mem, ea, cpu.read_x(rt))?;
+                        mmu.write_mem_u64(cpu, mem, ea.wrapping_add(stride), cpu.read_x(rt2))?;
                     } else {
-                        mem.write_u32(pa1, cpu.read_w(rt))?;
-                        mem.write_u32(pa2, cpu.read_w(rt2))?;
+                        mmu.write_mem_u32(cpu, mem, ea, cpu.read_w(rt))?;
+                        mmu.write_mem_u32(cpu, mem, ea.wrapping_add(stride), cpu.read_w(rt2))?;
                     }
                     cpu.exclusive_valid = 0;
                     cpu.write_w(rs, 0);
@@ -1141,8 +1135,7 @@ impl Interpreter {
             }
             Instruction::Ldar { size, rt, rn } => {
                 let ea = cpu.read_sp_or_x(rn);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
-                cpu.write_x(rt, read_sized(mem, pa, size)?);
+                cpu.write_x(rt, read_sized_va(mmu, cpu, mem, ea, size)?);
                 Ok(StepOutcome::Continue)
             }
             Instruction::Casp {
@@ -1156,23 +1149,24 @@ impl Interpreter {
                 let rs2 = Reg((rs.0 + 1) & 31);
                 let rt2 = Reg((rt.0 + 1) & 31);
                 let stride = if is_64 { 8u64 } else { 4u64 };
-                let pa1 = mmu.translate(cpu, mem, ea, true)?;
-                let pa2 = mmu.translate(cpu, mem, ea + stride, true)?;
+                let ea2 = ea.wrapping_add(stride);
+                mmu.translate(cpu, mem, ea, true)?;
+                mmu.translate(cpu, mem, ea2, true)?;
                 if is_64 {
-                    let old0 = mem.read_u64(pa1)?;
-                    let old1 = mem.read_u64(pa2)?;
+                    let old0 = mmu.read_mem_u64(cpu, mem, ea)?;
+                    let old1 = mmu.read_mem_u64(cpu, mem, ea2)?;
                     if old0 == cpu.read_x(rs) && old1 == cpu.read_x(rs2) {
-                        mem.write_u64(pa1, cpu.read_x(rt))?;
-                        mem.write_u64(pa2, cpu.read_x(rt2))?;
+                        mmu.write_mem_u64(cpu, mem, ea, cpu.read_x(rt))?;
+                        mmu.write_mem_u64(cpu, mem, ea2, cpu.read_x(rt2))?;
                     }
                     cpu.write_x(rs, old0);
                     cpu.write_x(rs2, old1);
                 } else {
-                    let old0 = mem.read_u32(pa1)?;
-                    let old1 = mem.read_u32(pa2)?;
+                    let old0 = mmu.read_mem_u32(cpu, mem, ea)?;
+                    let old1 = mmu.read_mem_u32(cpu, mem, ea2)?;
                     if old0 == cpu.read_w(rs) && old1 == cpu.read_w(rs2) {
-                        mem.write_u32(pa1, cpu.read_w(rt))?;
-                        mem.write_u32(pa2, cpu.read_w(rt2))?;
+                        mmu.write_mem_u32(cpu, mem, ea, cpu.read_w(rt))?;
+                        mmu.write_mem_u32(cpu, mem, ea2, cpu.read_w(rt2))?;
                     }
                     cpu.write_w(rs, old0);
                     cpu.write_w(rs2, old1);
@@ -1181,18 +1175,17 @@ impl Interpreter {
             }
             Instruction::Stlr { size, rt, rn } => {
                 let ea = cpu.read_sp_or_x(rn);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
-                write_sized(mem, pa, size, cpu.read_x(rt))?;
+                write_sized_va(mmu, cpu, mem, ea, size, cpu.read_x(rt))?;
                 Ok(StepOutcome::Continue)
             }
             Instruction::Ldadd {
                 size, rs, rt, rn, ..
             } => {
                 let ea = cpu.read_sp_or_x(rn);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
-                let old = read_sized(mem, pa, size)?;
+                mmu.translate(cpu, mem, ea, true)?;
+                let old = read_sized_va(mmu, cpu, mem, ea, size)?;
                 let new = old.wrapping_add(cpu.read_x(rs));
-                write_sized(mem, pa, size, new)?;
+                write_sized_va(mmu, cpu, mem, ea, size, new)?;
                 cpu.write_x(rt, old);
                 Ok(StepOutcome::Continue)
             }
@@ -1205,8 +1198,8 @@ impl Interpreter {
                 ..
             } => {
                 let ea = cpu.read_sp_or_x(rn);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
-                let old = read_sized(mem, pa, size)?;
+                mmu.translate(cpu, mem, ea, true)?;
+                let old = read_sized_va(mmu, cpu, mem, ea, size)?;
                 let mask = size_mask(size);
                 let sval = cpu.read_x(rs) & mask;
                 let oval = old & mask;
@@ -1228,7 +1221,7 @@ impl Interpreter {
                     7 => oval.min(sval),                                // LDUMIN
                     _ => oval,
                 };
-                write_sized(mem, pa, size, new_val)?;
+                write_sized_va(mmu, cpu, mem, ea, size, new_val)?;
                 cpu.write_x(rt, old);
                 Ok(StepOutcome::Continue)
             }
@@ -1236,11 +1229,11 @@ impl Interpreter {
                 size, rs, rt, rn, ..
             } => {
                 let ea = cpu.read_sp_or_x(rn);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
-                let old = read_sized(mem, pa, size)?;
+                mmu.translate(cpu, mem, ea, true)?;
+                let old = read_sized_va(mmu, cpu, mem, ea, size)?;
                 let mask = size_mask(size);
                 if (old & mask) == (cpu.read_x(rs) & mask) {
-                    write_sized(mem, pa, size, cpu.read_x(rt))?;
+                    write_sized_va(mmu, cpu, mem, ea, size, cpu.read_x(rt))?;
                 }
                 cpu.write_x(rs, old);
                 Ok(StepOutcome::Continue)
@@ -1249,9 +1242,9 @@ impl Interpreter {
                 size, rs, rt, rn, ..
             } => {
                 let ea = cpu.read_sp_or_x(rn);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
-                let old = read_sized(mem, pa, size)?;
-                write_sized(mem, pa, size, cpu.read_x(rs))?;
+                mmu.translate(cpu, mem, ea, true)?;
+                let old = read_sized_va(mmu, cpu, mem, ea, size)?;
+                write_sized_va(mmu, cpu, mem, ea, size, cpu.read_x(rs))?;
                 cpu.write_x(rt, old);
                 Ok(StepOutcome::Continue)
             }
@@ -1465,15 +1458,13 @@ impl Interpreter {
             }
             Instruction::LdrFpLiteral { size, vt, offset } => {
                 let ea = (pc as i64).wrapping_add(offset) as u64;
-                let pa = mmu.translate(cpu, mem, ea, false)?;
                 let mut v = [0u64; 2];
                 match size {
-                    4 => v[0] = mem.read_u32(pa)? as u64,
-                    8 => v[0] = mem.read_u64(pa)?,
+                    4 => v[0] = mmu.read_mem_u32(cpu, mem, ea)? as u64,
+                    8 => v[0] = mmu.read_mem_u64(cpu, mem, ea)?,
                     16 => {
-                        let pa2 = mmu.translate(cpu, mem, ea + 8, false)?;
-                        v[0] = mem.read_u64(pa)?;
-                        v[1] = mem.read_u64(pa2)?;
+                        v[0] = mmu.read_mem_u64(cpu, mem, ea)?;
+                        v[1] = mmu.read_mem_u64(cpu, mem, ea.wrapping_add(8))?;
                     }
                     _ => {}
                 }
@@ -1482,17 +1473,15 @@ impl Interpreter {
             }
             Instruction::LdrFp { size, vt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, false)?;
                 let mut v = [0u64; 2];
                 match size {
-                    1 => v[0] = mem.read_u8(pa)? as u64,
-                    2 => v[0] = mem.read_u16(pa)? as u64,
-                    4 => v[0] = mem.read_u32(pa)? as u64,
-                    8 => v[0] = mem.read_u64(pa)?,
+                    1 => v[0] = mmu.read_mem_u8(cpu, mem, ea)? as u64,
+                    2 => v[0] = mmu.read_mem_u16(cpu, mem, ea)? as u64,
+                    4 => v[0] = mmu.read_mem_u32(cpu, mem, ea)? as u64,
+                    8 => v[0] = mmu.read_mem_u64(cpu, mem, ea)?,
                     16 => {
-                        let pa2 = mmu.translate(cpu, mem, ea + 8, false)?;
-                        v[0] = mem.read_u64(pa)?;
-                        v[1] = mem.read_u64(pa2)?;
+                        v[0] = mmu.read_mem_u64(cpu, mem, ea)?;
+                        v[1] = mmu.read_mem_u64(cpu, mem, ea.wrapping_add(8))?;
                     }
                     _ => {}
                 }
@@ -1504,17 +1493,15 @@ impl Interpreter {
             }
             Instruction::StrFp { size, vt, rn, mode } => {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
-                let pa = mmu.translate(cpu, mem, ea, true)?;
                 let v = cpu.v[vt as usize];
                 match size {
-                    1 => mem.write_u8(pa, v[0] as u8)?,
-                    2 => mem.write_u16(pa, v[0] as u16)?,
-                    4 => mem.write_u32(pa, v[0] as u32)?,
-                    8 => mem.write_u64(pa, v[0])?,
+                    1 => mmu.write_mem_u8(cpu, mem, ea, v[0] as u8)?,
+                    2 => mmu.write_mem_u16(cpu, mem, ea, v[0] as u16)?,
+                    4 => mmu.write_mem_u32(cpu, mem, ea, v[0] as u32)?,
+                    8 => mmu.write_mem_u64(cpu, mem, ea, v[0])?,
                     16 => {
-                        let pa2 = mmu.translate(cpu, mem, ea + 8, true)?;
-                        mem.write_u64(pa, v[0])?;
-                        mem.write_u64(pa2, v[1])?;
+                        mmu.write_mem_u64(cpu, mem, ea, v[0])?;
+                        mmu.write_mem_u64(cpu, mem, ea.wrapping_add(8), v[1])?;
                     }
                     _ => {}
                 }
@@ -1533,16 +1520,14 @@ impl Interpreter {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
                 let stride = size as u64;
                 for (idx, reg) in [(0u64, vt), (1u64, vt2)] {
-                    let a = ea + idx * stride;
-                    let pa = mmu.translate(cpu, mem, a, false)?;
+                    let a = ea.wrapping_add(idx * stride);
                     let mut val = [0u64; 2];
                     match size {
-                        4 => val[0] = mem.read_u32(pa)? as u64,
-                        8 => val[0] = mem.read_u64(pa)?,
+                        4 => val[0] = mmu.read_mem_u32(cpu, mem, a)? as u64,
+                        8 => val[0] = mmu.read_mem_u64(cpu, mem, a)?,
                         16 => {
-                            let pa2 = mmu.translate(cpu, mem, a + 8, false)?;
-                            val[0] = mem.read_u64(pa)?;
-                            val[1] = mem.read_u64(pa2)?;
+                            val[0] = mmu.read_mem_u64(cpu, mem, a)?;
+                            val[1] = mmu.read_mem_u64(cpu, mem, a.wrapping_add(8))?;
                         }
                         _ => {}
                     }
@@ -1563,16 +1548,14 @@ impl Interpreter {
                 let (ea, wb) = compute_addr(cpu, rn, mode);
                 let stride = size as u64;
                 for (idx, reg) in [(0u64, vt), (1u64, vt2)] {
-                    let a = ea + idx * stride;
-                    let pa = mmu.translate(cpu, mem, a, true)?;
+                    let a = ea.wrapping_add(idx * stride);
                     let val = cpu.v[reg as usize];
                     match size {
-                        4 => mem.write_u32(pa, val[0] as u32)?,
-                        8 => mem.write_u64(pa, val[0])?,
+                        4 => mmu.write_mem_u32(cpu, mem, a, val[0] as u32)?,
+                        8 => mmu.write_mem_u64(cpu, mem, a, val[0])?,
                         16 => {
-                            let pa2 = mmu.translate(cpu, mem, a + 8, true)?;
-                            mem.write_u64(pa, val[0])?;
-                            mem.write_u64(pa2, val[1])?;
+                            mmu.write_mem_u64(cpu, mem, a, val[0])?;
+                            mmu.write_mem_u64(cpu, mem, a.wrapping_add(8), val[1])?;
                         }
                         _ => {}
                     }
@@ -2718,21 +2701,34 @@ fn size_mask(size: u8) -> u64 {
     }
 }
 
-fn read_sized<M: GuestMemory + ?Sized>(mem: &mut M, pa: u64, size: u8) -> Result<u64> {
+fn read_sized_va<M: GuestMemory + ?Sized>(
+    mmu: &mut Mmu,
+    cpu: &CpuState,
+    mem: &mut M,
+    va: u64,
+    size: u8,
+) -> Result<u64> {
     Ok(match size {
-        0 => mem.read_u8(pa)? as u64,
-        1 => mem.read_u16(pa)? as u64,
-        2 => mem.read_u32(pa)? as u64,
-        _ => mem.read_u64(pa)?,
+        0 => mmu.read_mem_u8(cpu, mem, va)? as u64,
+        1 => mmu.read_mem_u16(cpu, mem, va)? as u64,
+        2 => mmu.read_mem_u32(cpu, mem, va)? as u64,
+        _ => mmu.read_mem_u64(cpu, mem, va)?,
     })
 }
 
-fn write_sized<M: GuestMemory + ?Sized>(mem: &mut M, pa: u64, size: u8, val: u64) -> Result<()> {
+fn write_sized_va<M: GuestMemory + ?Sized>(
+    mmu: &mut Mmu,
+    cpu: &CpuState,
+    mem: &mut M,
+    va: u64,
+    size: u8,
+    val: u64,
+) -> Result<()> {
     match size {
-        0 => mem.write_u8(pa, val as u8),
-        1 => mem.write_u16(pa, val as u16),
-        2 => mem.write_u32(pa, val as u32),
-        _ => mem.write_u64(pa, val),
+        0 => mmu.write_mem_u8(cpu, mem, va, val as u8),
+        1 => mmu.write_mem_u16(cpu, mem, va, val as u16),
+        2 => mmu.write_mem_u32(cpu, mem, va, val as u32),
+        _ => mmu.write_mem_u64(cpu, mem, va, val),
     }
 }
 
