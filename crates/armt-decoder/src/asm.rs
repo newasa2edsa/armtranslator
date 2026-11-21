@@ -191,6 +191,114 @@ pub const fn lsrv(w: Width, rd: Reg, rn: Reg, rm: Reg) -> u32 {
         | ((rd.0 & 0x1F) as u32)
 }
 
+pub const fn udiv(w: Width, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    (sf_bit(w) << 31)
+        | (0b0011010110 << 21)
+        | (((rm.0 & 0x1F) as u32) << 16)
+        | (0b000010 << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rd.0 & 0x1F) as u32)
+}
+
+pub const fn msub(w: Width, rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
+    (sf_bit(w) << 31)
+        | (0b0011011000 << 21)
+        | (((rm.0 & 0x1F) as u32) << 16)
+        | (1 << 15)
+        | (((ra.0 & 0x1F) as u32) << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rd.0 & 0x1F) as u32)
+}
+
+pub const fn lsl_imm(w: Width, rd: Reg, rn: Reg, shift: u8) -> u32 {
+    let bits = if sf_bit(w) == 1 { 64u32 } else { 32u32 };
+    let sh = (shift as u32) & (bits - 1);
+    let immr = (bits - sh) & (bits - 1);
+    let imms = bits - 1 - sh;
+    (sf_bit(w) << 31)
+        | (0b10100110 << 23)
+        | (sf_bit(w) << 22)
+        | (immr << 16)
+        | (imms << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rd.0 & 0x1F) as u32)
+}
+
+pub const fn lsr_imm(w: Width, rd: Reg, rn: Reg, shift: u8) -> u32 {
+    let bits = if sf_bit(w) == 1 { 64u32 } else { 32u32 };
+    let sh = (shift as u32) & (bits - 1);
+    let imms = bits - 1;
+    (sf_bit(w) << 31)
+        | (0b10100110 << 23)
+        | (sf_bit(w) << 22)
+        | (sh << 16)
+        | (imms << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rd.0 & 0x1F) as u32)
+}
+
+pub const fn ldrh_imm(rt: Reg, rn: Reg, byte_offset: u32) -> u32 {
+    let imm12 = (byte_offset >> 1) & 0xFFF;
+    (0b01 << 30)
+        | (0b11100101 << 22)
+        | (imm12 << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rt.0 & 0x1F) as u32)
+}
+
+pub const fn strh_imm(rt: Reg, rn: Reg, byte_offset: u32) -> u32 {
+    let imm12 = (byte_offset >> 1) & 0xFFF;
+    (0b01 << 30)
+        | (0b11100100 << 22)
+        | (imm12 << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rt.0 & 0x1F) as u32)
+}
+
+pub const fn ldr_reg(w: Width, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    let size = match w {
+        Width::W32 => 2u32,
+        Width::X64 => 3u32,
+    };
+    (size << 30)
+        | (0b111000011 << 21)
+        | (((rm.0 & 0x1F) as u32) << 16)
+        | (0b011_0_10 << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rt.0 & 0x1F) as u32)
+}
+
+pub const fn str_reg(w: Width, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    let size = match w {
+        Width::W32 => 2u32,
+        Width::X64 => 3u32,
+    };
+    (size << 30)
+        | (0b111000001 << 21)
+        | (((rm.0 & 0x1F) as u32) << 16)
+        | (0b011_0_10 << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rt.0 & 0x1F) as u32)
+}
+
+pub const fn ldrb_reg(rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    (0b00 << 30)
+        | (0b111000011 << 21)
+        | (((rm.0 & 0x1F) as u32) << 16)
+        | (0b011_0_10 << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rt.0 & 0x1F) as u32)
+}
+
+pub const fn strb_reg(rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    (0b00 << 30)
+        | (0b111000001 << 21)
+        | (((rm.0 & 0x1F) as u32) << 16)
+        | (0b011_0_10 << 10)
+        | (((rn.0 & 0x1F) as u32) << 5)
+        | ((rt.0 & 0x1F) as u32)
+}
+
 pub const fn b(byte_offset: i64) -> u32 {
     let imm26 = ((byte_offset >> 2) as u32) & 0x03FF_FFFF;
     0x1400_0000 | imm26

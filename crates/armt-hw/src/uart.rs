@@ -1,11 +1,12 @@
 use armt_core::{MmioDevice, Result};
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
-/// ARM PrimeCell PL011 UART serial controller.
+/// ARM PrimeCell PL011 UART serial controller with thread-safe TX/RX mirrors for live GUI console.
 pub struct Pl011Uart {
-    tx_buf: Vec<u8>,
-    rx_fifo: VecDeque<u8>,
+    tx_buf: Arc<Mutex<Vec<u8>>>,
+    rx_fifo: Arc<Mutex<VecDeque<u8>>>,
     ibrd: u32,
     fbrd: u32,
     lcr_h: u32,
@@ -18,8 +19,8 @@ pub struct Pl011Uart {
 impl Pl011Uart {
     pub fn new(echo_stdout: bool) -> Self {
         Self {
-            tx_buf: Vec::new(),
-            rx_fifo: VecDeque::new(),
+            tx_buf: Arc::new(Mutex::new(Vec::new())),
+            rx_fifo: Arc::new(Mutex::new(VecDeque::new())),
             ibrd: 0,
             fbrd: 0,
             lcr_h: 0,
@@ -30,31 +31,44 @@ impl Pl011Uart {
         }
     }
 
+    pub fn shared_tx(&self) -> Arc<Mutex<Vec<u8>>> {
+        self.tx_buf.clone()
+    }
+
+    pub fn shared_rx(&self) -> Arc<Mutex<VecDeque<u8>>> {
+        self.rx_fifo.clone()
+    }
+
     pub fn set_echo_stdout(&mut self, echo: bool) {
         self.echo_stdout = echo;
     }
 
     pub fn push_rx_byte(&mut self, b: u8) {
-        self.rx_fifo.push_back(b);
+        self.rx_fifo.lock().unwrap().push_back(b);
         self.ris |= 0x10;
     }
 
     pub fn push_rx_bytes(&mut self, data: &[u8]) {
+        let mut rx = self.rx_fifo.lock().unwrap();
         for &b in data {
-            self.push_rx_byte(b);
+            rx.push_back(b);
         }
+        self.ris |= 0x10;
     }
 
-    pub fn tx_bytes(&self) -> &[u8] {
-        &self.tx_buf
+    pub fn tx_bytes(&self) -> Vec<u8> {
+        self.tx_buf.lock().unwrap().clone()
     }
 
     pub fn tx_string(&self) -> String {
-        String::from_utf8_lossy(&self.tx_buf).into_owned()
+        let g = self.tx_buf.lock().unwrap();
+        String::from_utf8_lossy(&g).into_owned()
     }
 
     pub fn irq_pending(&self) -> bool {
-        (self.ris & self.imsc) != 0
+        let rx_nonempty = !self.rx_fifo.lock().unwrap().is_empty();
+        let eff_ris = if rx_nonempty { self.ris | 0x10 } else { self.ris };
+        (eff_ris & self.imsc) != 0
     }
 }
 
@@ -66,8 +80,9 @@ impl MmioDevice for Pl011Uart {
     fn read(&mut self, offset: u64, _size: u8) -> Result<u64> {
         let val = match offset {
             0x00 => {
-                let ch = self.rx_fifo.pop_front().unwrap_or(0) as u64;
-                if self.rx_fifo.is_empty() {
+                let mut rx = self.rx_fifo.lock().unwrap();
+                let ch = rx.pop_front().unwrap_or(0) as u64;
+                if rx.is_empty() {
                     self.ris &= !0x10;
                 }
                 ch
@@ -75,7 +90,7 @@ impl MmioDevice for Pl011Uart {
             0x18 => {
                 // FR: TXFE (bit 7) always set, RXFE (bit 4) set when RX empty
                 let mut fr = 0x80u64;
-                if self.rx_fifo.is_empty() {
+                if self.rx_fifo.lock().unwrap().is_empty() {
                     fr |= 0x10;
                 }
                 fr
@@ -104,7 +119,7 @@ impl MmioDevice for Pl011Uart {
         match offset {
             0x00 => {
                 let ch = (val & 0xFF) as u8;
-                self.tx_buf.push(ch);
+                self.tx_buf.lock().unwrap().push(ch);
                 if self.echo_stdout {
                     let _ = std::io::stdout().write_all(&[ch]);
                     let _ = std::io::stdout().flush();

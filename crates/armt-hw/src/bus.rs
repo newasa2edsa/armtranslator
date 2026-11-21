@@ -1,5 +1,7 @@
 use crate::gicv3::GicV3;
+use crate::gpu::{AppleParavirtGpu, VirtioGpu};
 use crate::memmap::Vma2MemMap;
+use crate::pcie::PcieRootComplex;
 use crate::timer::GenericTimer;
 use crate::uart::Pl011Uart;
 use crate::virtio::{Framebuffer, VirtioBlk, VirtioInput};
@@ -20,8 +22,12 @@ pub struct Vma2Bus {
     pub aes2: VmaAesDevice,
     pub pvpanic: PvPanicDevice,
     pub virtio_blk: VirtioBlk,
+    pub virtio_gpu: VirtioGpu,
     pub virtio_input: VirtioInput,
+    pub apple_gfx: AppleParavirtGpu,
+    pub pcie: PcieRootComplex,
     pub framebuffer: Framebuffer,
+    pub apple_sysregs: BTreeMap<u16, u64>,
     pub unknown_mmio_reads: BTreeMap<u64, u64>,
     pub unknown_mmio_writes: BTreeMap<u64, u64>,
     pub unknown_sysregs: BTreeMap<u16, u64>,
@@ -32,6 +38,8 @@ impl Vma2Bus {
         let ram = vec![0u8; memmap.ram_size as usize];
         let fb = Framebuffer::new(memmap.framebuffer_width, memmap.framebuffer_height);
         let ram_mb = memmap.ram_size / (1024 * 1024);
+        let w = memmap.framebuffer_width;
+        let h = memmap.framebuffer_height;
         Self {
             memmap,
             ram,
@@ -43,9 +51,13 @@ impl Vma2Bus {
             aes1: VmaAesDevice::new(),
             aes2: VmaAesDevice::new(),
             pvpanic: PvPanicDevice::new(),
-            virtio_blk: VirtioBlk::new_memory_disk(1024 * 1024),
+            virtio_blk: VirtioBlk::new_memory_disk(16 * 1024 * 1024),
+            virtio_gpu: VirtioGpu::new(w, h),
             virtio_input: VirtioInput::new(),
+            apple_gfx: AppleParavirtGpu::new(w, h),
+            pcie: PcieRootComplex::new(),
             framebuffer: fb,
+            apple_sysregs: BTreeMap::new(),
             unknown_mmio_reads: BTreeMap::new(),
             unknown_mmio_writes: BTreeMap::new(),
             unknown_sysregs: BTreeMap::new(),
@@ -54,11 +66,24 @@ impl Vma2Bus {
 
     pub fn tick(&mut self, cycles: u64) {
         self.timer.tick(cycles);
-        if let Some(irq) = self.timer.active_irq() {
+        let active_timer_irq = self.timer.active_irq();
+        if active_timer_irq != Some(27) {
+            self.gic.clear_irq(27);
+        }
+        if active_timer_irq != Some(30) {
+            self.gic.clear_irq(30);
+        }
+        if let Some(irq) = active_timer_irq {
             self.gic.raise_irq(irq);
         }
         if self.uart0.irq_pending() {
             self.gic.raise_irq(33);
+        }
+        if self.virtio_gpu.irq_pending() {
+            self.gic.raise_irq(34);
+        }
+        if self.virtio_input.irq_pending() {
+            self.gic.raise_irq(35);
         }
     }
 
@@ -87,6 +112,9 @@ impl Vma2Bus {
         if addr >= m.gicr_base && addr < m.gicr_base + m.gicr_size {
             return self.gic.read_gicr(addr - m.gicr_base);
         }
+        if addr >= m.gic_msi_base && addr < m.gic_msi_base + m.gic_msi_size {
+            return self.gic.read_msi(addr - m.gic_msi_base);
+        }
         if addr >= m.pvpanic_base && addr < m.pvpanic_base + m.pvpanic_size {
             return self.pvpanic.read(addr - m.pvpanic_base, size);
         }
@@ -105,8 +133,20 @@ impl Vma2Bus {
         if addr >= m.virtio_blk_base && addr < m.virtio_blk_base + m.virtio_blk_size {
             return self.virtio_blk.read(addr - m.virtio_blk_base, size);
         }
+        if addr >= m.virtio_gpu_base && addr < m.virtio_gpu_base + m.virtio_gpu_size {
+            return self.virtio_gpu.read(addr - m.virtio_gpu_base, size);
+        }
         if addr >= m.virtio_input_base && addr < m.virtio_input_base + m.virtio_input_size {
             return self.virtio_input.read(addr - m.virtio_input_base, size);
+        }
+        if addr >= m.apple_gfx_base && addr < m.apple_gfx_base + m.apple_gfx_size {
+            return self.apple_gfx.read(addr - m.apple_gfx_base, size);
+        }
+        if addr >= m.pcie_ecam_base && addr < m.pcie_ecam_base + m.pcie_ecam_size {
+            return self.pcie.read_ecam(addr - m.pcie_ecam_base, size);
+        }
+        if self.pcie.contains_bar(addr) {
+            return self.pcie.read_bar(addr, size, &self.virtio_blk);
         }
 
         // Graceful probe handling for Apple-specific MMIO probes during early boot.
@@ -138,6 +178,9 @@ impl Vma2Bus {
         if addr >= m.gicr_base && addr < m.gicr_base + m.gicr_size {
             return self.gic.write_gicr(addr - m.gicr_base, val);
         }
+        if addr >= m.gic_msi_base && addr < m.gic_msi_base + m.gic_msi_size {
+            return self.gic.write_msi(addr - m.gic_msi_base, val);
+        }
         if addr >= m.pvpanic_base && addr < m.pvpanic_base + m.pvpanic_size {
             return self.pvpanic.write(addr - m.pvpanic_base, size, val);
         }
@@ -156,8 +199,43 @@ impl Vma2Bus {
         if addr >= m.virtio_blk_base && addr < m.virtio_blk_base + m.virtio_blk_size {
             return self.virtio_blk.write(addr - m.virtio_blk_base, size, val);
         }
+        if addr >= m.virtio_gpu_base && addr < m.virtio_gpu_base + m.virtio_gpu_size {
+            let off = addr - m.virtio_gpu_base;
+            self.virtio_gpu.write(off, size, val)?;
+            if self.virtio_gpu.notify_pending.is_some() {
+                self.virtio_gpu
+                    .process_queue(&mut self.ram, self.memmap.ram_base, &self.framebuffer);
+            }
+            return Ok(());
+        }
         if addr >= m.virtio_input_base && addr < m.virtio_input_base + m.virtio_input_size {
             return self.virtio_input.write(addr - m.virtio_input_base, size, val);
+        }
+        if addr >= m.apple_gfx_base && addr < m.apple_gfx_base + m.apple_gfx_size {
+            let off = addr - m.apple_gfx_base;
+            self.apple_gfx.write(off, size, val)?;
+            if self.apple_gfx.doorbell_pending {
+                self.apple_gfx
+                    .execute_cmd_ring(&self.ram, self.memmap.ram_base, &self.framebuffer);
+            }
+            return Ok(());
+        }
+        if addr >= m.pcie_ecam_base && addr < m.pcie_ecam_base + m.pcie_ecam_size {
+            return self.pcie.write_ecam(addr - m.pcie_ecam_base, size, val);
+        }
+        if self.pcie.contains_bar(addr) {
+            let ram_base = self.memmap.ram_base;
+            if let Some((msi_addr, msi_data)) = self.pcie.write_bar(
+                addr,
+                size,
+                val,
+                &mut self.virtio_blk,
+                &mut self.ram,
+                ram_base,
+            )? {
+                let _ = self.write_u32(msi_addr, msi_data);
+            }
+            return Ok(());
         }
 
         if addr < 0x8000_0000 {
@@ -285,6 +363,9 @@ impl SysRegBus for Vma2Bus {
         if let Some(v) = self.gic.read_sysreg(reg) {
             return Some(v);
         }
+        if let Some(&v) = self.apple_sysregs.get(&reg.0) {
+            return Some(v);
+        }
         *self.unknown_sysregs.entry(reg.0).or_insert(0) += 1;
         None
     }
@@ -294,6 +375,10 @@ impl SysRegBus for Vma2Bus {
             return true;
         }
         if self.gic.write_sysreg(reg, val) {
+            return true;
+        }
+        if reg.is_apple_impl_defined() {
+            self.apple_sysregs.insert(reg.0, val);
             return true;
         }
         *self.unknown_sysregs.entry(reg.0).or_insert(0) += 1;
@@ -358,5 +443,140 @@ mod tests {
         // Framebuffer write
         bus.write_u32(0x6000_0000, 0x00FF_8800).unwrap();
         assert_eq!(bus.framebuffer.non_zero_pixels(), 1);
+    }
+
+    #[test]
+    fn test_apple_gfx_virtio_gpu_and_input() {
+        use crate::gpu::{
+            GPU_CMD_CLEAR, GPU_CMD_DRAW_TEXT, GPU_CMD_PRESENT, GPU_CMD_ROUND_RECT,
+            GPU_CMD_SET_CURSOR,
+        };
+        let mut bus = Vma2Bus::new(Vma2MemMap::with_ram_mb(16), false);
+
+        // Shared thread-safe VirtioInput mouse + char
+        let shared_in = bus.virtio_input.shared();
+        {
+            let mut g = shared_in.lock().unwrap();
+            g.push_mouse_move(420, 310);
+            g.push_mouse_button(0, true, 420, 310);
+            g.push_char(b'A');
+        }
+        assert_eq!(bus.read_u32(0x200a_2100).unwrap(), 420);
+        assert_eq!(bus.read_u32(0x200a_2104).unwrap(), 310);
+        assert_eq!(bus.read_u32(0x200a_2108).unwrap(), 1);
+        assert_eq!(bus.read_u32(0x200a_2110).unwrap(), 3);
+        assert_eq!(bus.read_u32(0x200a_2114).unwrap(), 2); // MOUSE_MOVE
+        assert_eq!(bus.read_u32(0x200a_2114).unwrap(), 3); // MOUSE_BTN
+        assert_eq!(bus.read_u32(0x200a_2114).unwrap(), 4); // CHAR
+        assert_eq!(bus.read_u32(0x200a_2118).unwrap(), b'A' as u32);
+
+        // AppleParavirtGpu cmd ring test
+        let text_pa = 0x8001_0000u64;
+        bus.write_bytes(text_pa, b"Hello RTX!\0").unwrap();
+        let ring_pa = 0x8002_0000u64;
+        let cmds: [(u32, u32, i32, i32, u32, u32, u32, u32); 5] = [
+            (GPU_CMD_CLEAR, 0, 0, 0, 0, 0, 0xFF10_1828, 0),
+            (GPU_CMD_ROUND_RECT, 12, 100, 100, 300, 160, 0xFF20_2C44, 0xFF40_6090),
+            (
+                GPU_CMD_DRAW_TEXT,
+                2 | (32 << 8),
+                120,
+                140,
+                text_pa as u32,
+                (text_pa >> 32) as u32,
+                0xFFFF_FFFF,
+                0,
+            ),
+            (GPU_CMD_SET_CURSOR, 1, 250, 220, 0, 0, 0, 0),
+            (GPU_CMD_PRESENT, 0, 0, 0, 0, 0, 0, 0),
+        ];
+        for (idx, c) in cmds.iter().enumerate() {
+            let p = ring_pa + (idx as u64) * 32;
+            bus.write_u32(p, c.0).unwrap();
+            bus.write_u32(p + 4, c.1).unwrap();
+            bus.write_u32(p + 8, c.2 as u32).unwrap();
+            bus.write_u32(p + 12, c.3 as u32).unwrap();
+            bus.write_u32(p + 16, c.4).unwrap();
+            bus.write_u32(p + 20, c.5).unwrap();
+            bus.write_u32(p + 24, c.6).unwrap();
+            bus.write_u32(p + 28, c.7).unwrap();
+        }
+        bus.write_u64(0x200b_0020, ring_pa).unwrap();
+        bus.write_u32(0x200b_0024, cmds.len() as u32).unwrap();
+        bus.write_u32(0x200b_0028, 1).unwrap();
+        assert_eq!(bus.apple_gfx.frame_count, 1);
+        assert!(bus.framebuffer.non_zero_pixels() > 100_000);
+        assert_eq!(bus.framebuffer.cursor_state(), (250, 220, true));
+
+        // VirtIO-GPU v2 GET_DISPLAY_INFO + RESOURCE_CREATE_2D + ATTACH + SET_SCANOUT + TRANSFER + FLUSH
+        assert_eq!(bus.read_u32(0x200a_1008).unwrap(), 16);
+        let desc = 0x8003_0000u64;
+        let avail = 0x8003_1000u64;
+        let used = 0x8003_2000u64;
+        let req_pa = 0x8003_3000u64;
+        let resp_pa = 0x8003_4000u64;
+        let backing_pa = 0x8004_0000u64;
+        bus.write_u32(backing_pa, 0x00AA_BBCC).unwrap();
+
+        bus.write_u32(0x200a_1030, 0).unwrap();
+        bus.write_u32(0x200a_1038, 16).unwrap();
+        bus.write_u32(0x200a_1080, desc as u32).unwrap();
+        bus.write_u32(0x200a_1090, avail as u32).unwrap();
+        bus.write_u32(0x200a_10a0, used as u32).unwrap();
+        bus.write_u32(0x200a_1044, 1).unwrap();
+
+        let push_cmd = |bus: &mut Vma2Bus, slot: u16, req_bytes: &[u8]| {
+            bus.write_bytes(req_pa, req_bytes).unwrap();
+            // desc 0: req
+            bus.write_u64(desc, req_pa).unwrap();
+            bus.write_u32(desc + 8, req_bytes.len() as u32).unwrap();
+            bus.write_u16(desc + 12, 1).unwrap(); // NEXT
+            bus.write_u16(desc + 14, 1).unwrap();
+            // desc 1: resp
+            bus.write_u64(desc + 16, resp_pa).unwrap();
+            bus.write_u32(desc + 24, 512).unwrap();
+            bus.write_u16(desc + 28, 2).unwrap(); // WRITE
+            bus.write_u16(desc + 30, 0).unwrap();
+            bus.write_u16(avail + 4 + (slot as u64 % 16) * 2, 0).unwrap();
+            bus.write_u16(avail + 2, slot + 1).unwrap();
+            bus.write_u32(0x200a_1050, 0).unwrap();
+        };
+
+        // 1) RESOURCE_CREATE_2D (id=1, fmt=1, w=16, h=16)
+        let mut r1 = vec![0u8; 40];
+        r1[0..4].copy_from_slice(&0x0101u32.to_le_bytes());
+        r1[24..28].copy_from_slice(&1u32.to_le_bytes());
+        r1[28..32].copy_from_slice(&1u32.to_le_bytes());
+        r1[32..36].copy_from_slice(&16u32.to_le_bytes());
+        r1[36..40].copy_from_slice(&16u32.to_le_bytes());
+        push_cmd(&mut bus, 0, &r1);
+
+        // 2) ATTACH_BACKING (id=1, nr=1, addr=backing_pa, len=1024)
+        let mut r2 = vec![0u8; 48];
+        r2[0..4].copy_from_slice(&0x0106u32.to_le_bytes());
+        r2[24..28].copy_from_slice(&1u32.to_le_bytes());
+        r2[28..32].copy_from_slice(&1u32.to_le_bytes());
+        r2[32..40].copy_from_slice(&backing_pa.to_le_bytes());
+        r2[40..44].copy_from_slice(&1024u32.to_le_bytes());
+        push_cmd(&mut bus, 1, &r2);
+
+        // 3) TRANSFER_TO_HOST_2D (w=16,h=16, id=1)
+        let mut r3 = vec![0u8; 56];
+        r3[0..4].copy_from_slice(&0x0105u32.to_le_bytes());
+        r3[32..36].copy_from_slice(&16u32.to_le_bytes());
+        r3[36..40].copy_from_slice(&16u32.to_le_bytes());
+        r3[48..52].copy_from_slice(&1u32.to_le_bytes());
+        push_cmd(&mut bus, 2, &r3);
+
+        // 4) RESOURCE_FLUSH (id=1)
+        let mut r4 = vec![0u8; 48];
+        r4[0..4].copy_from_slice(&0x0104u32.to_le_bytes());
+        r4[32..36].copy_from_slice(&16u32.to_le_bytes());
+        r4[36..40].copy_from_slice(&16u32.to_le_bytes());
+        r4[40..44].copy_from_slice(&1u32.to_le_bytes());
+        push_cmd(&mut bus, 3, &r4);
+
+        assert_eq!(bus.virtio_gpu.flushes, 1);
+        assert_eq!(bus.framebuffer.read_bytes(0, 4), 0x00AA_BBCC);
     }
 }

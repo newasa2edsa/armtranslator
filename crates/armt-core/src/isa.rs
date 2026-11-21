@@ -287,30 +287,56 @@ impl SysReg {
     pub const CTR_EL0: SysReg = SysReg::from_fields(3, 3, 0, 0, 1);
     pub const DCZID_EL0: SysReg = SysReg::from_fields(3, 3, 0, 0, 7);
     pub const ID_AA64PFR0_EL1: SysReg = SysReg::from_fields(3, 0, 0, 4, 0);
+    pub const ID_AA64PFR1_EL1: SysReg = SysReg::from_fields(3, 0, 0, 4, 1);
+    pub const ID_AA64DFR0_EL1: SysReg = SysReg::from_fields(3, 0, 0, 5, 0);
     pub const ID_AA64ISAR0_EL1: SysReg = SysReg::from_fields(3, 0, 0, 6, 0);
     pub const ID_AA64ISAR1_EL1: SysReg = SysReg::from_fields(3, 0, 0, 6, 1);
     pub const ID_AA64MMFR0_EL1: SysReg = SysReg::from_fields(3, 0, 0, 7, 0);
+    pub const ID_AA64MMFR1_EL1: SysReg = SysReg::from_fields(3, 0, 0, 7, 1);
+    pub const ID_AA64MMFR2_EL1: SysReg = SysReg::from_fields(3, 0, 0, 7, 2);
+    pub const CCSIDR_EL1: SysReg = SysReg::from_fields(3, 1, 0, 0, 0);
+    pub const CLIDR_EL1: SysReg = SysReg::from_fields(3, 1, 0, 0, 1);
+    pub const CSSELR_EL1: SysReg = SysReg::from_fields(3, 2, 0, 0, 0);
     pub const SCTLR_EL1: SysReg = SysReg::from_fields(3, 0, 1, 0, 0);
     pub const CPACR_EL1: SysReg = SysReg::from_fields(3, 0, 1, 0, 2);
     pub const TTBR0_EL1: SysReg = SysReg::from_fields(3, 0, 2, 0, 0);
     pub const TTBR1_EL1: SysReg = SysReg::from_fields(3, 0, 2, 0, 1);
     pub const TCR_EL1: SysReg = SysReg::from_fields(3, 0, 2, 0, 2);
+    pub const MDSCR_EL1: SysReg = SysReg::from_fields(2, 0, 0, 2, 2);
     pub const SPSR_EL1: SysReg = SysReg::from_fields(3, 0, 4, 0, 0);
     pub const ELR_EL1: SysReg = SysReg::from_fields(3, 0, 4, 0, 1);
     pub const SP_EL0: SysReg = SysReg::from_fields(3, 0, 4, 1, 0);
+    pub const SPSEL: SysReg = SysReg::from_fields(3, 0, 4, 2, 0);
+    pub const PAN: SysReg = SysReg::from_fields(3, 0, 4, 2, 3);
     pub const NZCV: SysReg = SysReg::from_fields(3, 3, 4, 2, 0);
     pub const DAIF: SysReg = SysReg::from_fields(3, 3, 4, 2, 1);
     pub const CURRENTEL: SysReg = SysReg::from_fields(3, 0, 4, 2, 2);
     pub const ICC_PMR_EL1: SysReg = SysReg::from_fields(3, 0, 4, 6, 0);
     pub const ESR_EL1: SysReg = SysReg::from_fields(3, 0, 5, 2, 0);
     pub const FAR_EL1: SysReg = SysReg::from_fields(3, 0, 6, 0, 0);
+    pub const PAR_EL1: SysReg = SysReg::from_fields(3, 0, 7, 4, 0);
     pub const MAIR_EL1: SysReg = SysReg::from_fields(3, 0, 10, 2, 0);
+    pub const AMAIR_EL1: SysReg = SysReg::from_fields(3, 0, 10, 3, 0);
     pub const VBAR_EL1: SysReg = SysReg::from_fields(3, 0, 12, 0, 0);
+    pub const ISR_EL1: SysReg = SysReg::from_fields(3, 0, 12, 1, 0);
+    pub const ICC_IAR0_EL1: SysReg = SysReg::from_fields(3, 0, 12, 8, 0);
+    pub const ICC_EOIR0_EL1: SysReg = SysReg::from_fields(3, 0, 12, 8, 1);
+    pub const ICC_HPPIR0_EL1: SysReg = SysReg::from_fields(3, 0, 12, 8, 2);
+    pub const ICC_BPR0_EL1: SysReg = SysReg::from_fields(3, 0, 12, 8, 3);
+    pub const ICC_DIR_EL1: SysReg = SysReg::from_fields(3, 0, 12, 11, 1);
+    pub const ICC_RPR_EL1: SysReg = SysReg::from_fields(3, 0, 12, 11, 3);
+    pub const ICC_SGI1R_EL1: SysReg = SysReg::from_fields(3, 0, 12, 11, 5);
+    pub const ICC_ASGI1R_EL1: SysReg = SysReg::from_fields(3, 0, 12, 11, 6);
+    pub const ICC_SGI0R_EL1: SysReg = SysReg::from_fields(3, 0, 12, 11, 7);
     pub const ICC_IAR1_EL1: SysReg = SysReg::from_fields(3, 0, 12, 12, 0);
     pub const ICC_EOIR1_EL1: SysReg = SysReg::from_fields(3, 0, 12, 12, 1);
+    pub const ICC_HPPIR1_EL1: SysReg = SysReg::from_fields(3, 0, 12, 12, 2);
     pub const ICC_BPR1_EL1: SysReg = SysReg::from_fields(3, 0, 12, 12, 3);
+    pub const ICC_CTLR_EL1: SysReg = SysReg::from_fields(3, 0, 12, 12, 4);
     pub const ICC_SRE_EL1: SysReg = SysReg::from_fields(3, 0, 12, 12, 5);
+    pub const ICC_IGRPEN0_EL1: SysReg = SysReg::from_fields(3, 0, 12, 12, 6);
     pub const ICC_IGRPEN1_EL1: SysReg = SysReg::from_fields(3, 0, 12, 12, 7);
+    pub const CONTEXTIDR_EL1: SysReg = SysReg::from_fields(3, 0, 13, 0, 1);
     pub const TPIDR_EL0: SysReg = SysReg::from_fields(3, 3, 13, 0, 2);
     pub const TPIDRRO_EL0: SysReg = SysReg::from_fields(3, 3, 13, 0, 3);
     pub const TPIDR_EL1: SysReg = SysReg::from_fields(3, 0, 13, 0, 4);
@@ -331,30 +357,56 @@ impl SysReg {
             Self::CTR_EL0 => "ctr_el0".into(),
             Self::DCZID_EL0 => "dczid_el0".into(),
             Self::ID_AA64PFR0_EL1 => "id_aa64pfr0_el1".into(),
+            Self::ID_AA64PFR1_EL1 => "id_aa64pfr1_el1".into(),
+            Self::ID_AA64DFR0_EL1 => "id_aa64dfr0_el1".into(),
             Self::ID_AA64ISAR0_EL1 => "id_aa64isar0_el1".into(),
             Self::ID_AA64ISAR1_EL1 => "id_aa64isar1_el1".into(),
             Self::ID_AA64MMFR0_EL1 => "id_aa64mmfr0_el1".into(),
+            Self::ID_AA64MMFR1_EL1 => "id_aa64mmfr1_el1".into(),
+            Self::ID_AA64MMFR2_EL1 => "id_aa64mmfr2_el1".into(),
+            Self::CCSIDR_EL1 => "ccsidr_el1".into(),
+            Self::CLIDR_EL1 => "clidr_el1".into(),
+            Self::CSSELR_EL1 => "csselr_el1".into(),
             Self::SCTLR_EL1 => "sctlr_el1".into(),
             Self::CPACR_EL1 => "cpacr_el1".into(),
             Self::TTBR0_EL1 => "ttbr0_el1".into(),
             Self::TTBR1_EL1 => "ttbr1_el1".into(),
             Self::TCR_EL1 => "tcr_el1".into(),
+            Self::MDSCR_EL1 => "mdscr_el1".into(),
             Self::SPSR_EL1 => "spsr_el1".into(),
             Self::ELR_EL1 => "elr_el1".into(),
             Self::SP_EL0 => "sp_el0".into(),
+            Self::SPSEL => "spsel".into(),
+            Self::PAN => "pan".into(),
             Self::NZCV => "nzcv".into(),
             Self::DAIF => "daif".into(),
             Self::CURRENTEL => "currentel".into(),
             Self::ICC_PMR_EL1 => "icc_pmr_el1".into(),
             Self::ESR_EL1 => "esr_el1".into(),
             Self::FAR_EL1 => "far_el1".into(),
+            Self::PAR_EL1 => "par_el1".into(),
             Self::MAIR_EL1 => "mair_el1".into(),
+            Self::AMAIR_EL1 => "amair_el1".into(),
             Self::VBAR_EL1 => "vbar_el1".into(),
+            Self::ISR_EL1 => "isr_el1".into(),
+            Self::ICC_IAR0_EL1 => "icc_iar0_el1".into(),
+            Self::ICC_EOIR0_EL1 => "icc_eoir0_el1".into(),
+            Self::ICC_HPPIR0_EL1 => "icc_hppir0_el1".into(),
+            Self::ICC_BPR0_EL1 => "icc_bpr0_el1".into(),
+            Self::ICC_DIR_EL1 => "icc_dir_el1".into(),
+            Self::ICC_RPR_EL1 => "icc_rpr_el1".into(),
+            Self::ICC_SGI1R_EL1 => "icc_sgi1r_el1".into(),
+            Self::ICC_ASGI1R_EL1 => "icc_asgi1r_el1".into(),
+            Self::ICC_SGI0R_EL1 => "icc_sgi0r_el1".into(),
             Self::ICC_IAR1_EL1 => "icc_iar1_el1".into(),
             Self::ICC_EOIR1_EL1 => "icc_eoir1_el1".into(),
+            Self::ICC_HPPIR1_EL1 => "icc_hppir1_el1".into(),
             Self::ICC_BPR1_EL1 => "icc_bpr1_el1".into(),
+            Self::ICC_CTLR_EL1 => "icc_ctlr_el1".into(),
             Self::ICC_SRE_EL1 => "icc_sre_el1".into(),
+            Self::ICC_IGRPEN0_EL1 => "icc_igrpen0_el1".into(),
             Self::ICC_IGRPEN1_EL1 => "icc_igrpen1_el1".into(),
+            Self::CONTEXTIDR_EL1 => "contextidr_el1".into(),
             Self::TPIDR_EL0 => "tpidr_el0".into(),
             Self::TPIDRRO_EL0 => "tpidrro_el0".into(),
             Self::TPIDR_EL1 => "tpidr_el1".into(),
@@ -432,7 +484,9 @@ pub enum Instruction {
     Madd { w: Width, rd: Reg, rn: Reg, rm: Reg, ra: Reg },
     Msub { w: Width, rd: Reg, rn: Reg, rm: Reg, ra: Reg },
     Smaddl { rd: Reg, rn: Reg, rm: Reg, ra: Reg },
+    Smsubl { rd: Reg, rn: Reg, rm: Reg, ra: Reg },
     Umaddl { rd: Reg, rn: Reg, rm: Reg, ra: Reg },
+    Umsubl { rd: Reg, rn: Reg, rm: Reg, ra: Reg },
     Smulh { rd: Reg, rn: Reg, rm: Reg },
     Umulh { rd: Reg, rn: Reg, rm: Reg },
     Udiv { w: Width, rd: Reg, rn: Reg, rm: Reg },
@@ -460,6 +514,7 @@ pub enum Instruction {
     Blr { rn: Reg },
     Ret { rn: Reg },
     PacHint { op: PacOp, rd: Reg, rn: Reg },
+    Pacga { rd: Reg, rn: Reg, rm: Reg },
 
     // --- Loads & Stores ---
     Ldr { w: Width, rt: Reg, rn: Reg, mode: AddrMode },
@@ -477,10 +532,14 @@ pub enum Instruction {
     Ldpsw { rt: Reg, rt2: Reg, rn: Reg, mode: AddrMode },
     Ldxr { size: u8, acquire: bool, rt: Reg, rn: Reg },
     Stxr { size: u8, release: bool, rs: Reg, rt: Reg, rn: Reg },
+    Ldxp { is_64: bool, acquire: bool, rt: Reg, rt2: Reg, rn: Reg },
+    Stxp { is_64: bool, release: bool, rs: Reg, rt: Reg, rt2: Reg, rn: Reg },
     Ldar { size: u8, rt: Reg, rn: Reg },
     Stlr { size: u8, rt: Reg, rn: Reg },
     Ldadd { size: u8, acquire: bool, release: bool, rs: Reg, rt: Reg, rn: Reg },
+    LseAtomic { size: u8, op: u8, acquire: bool, release: bool, rs: Reg, rt: Reg, rn: Reg },
     Cas { size: u8, acquire: bool, release: bool, rs: Reg, rt: Reg, rn: Reg },
+    Casp { is_64: bool, acquire: bool, release: bool, rs: Reg, rt: Reg, rn: Reg },
     Swp { size: u8, acquire: bool, release: bool, rs: Reg, rt: Reg, rn: Reg },
     Prfm,
 
@@ -523,13 +582,61 @@ pub enum Instruction {
     Fcvtzs { is_64: bool, w: Width, rd: Reg, rn: u8 },
     Fcvtzu { is_64: bool, w: Width, rd: Reg, rn: u8 },
     LdrFp { size: u8, vt: u8, rn: Reg, mode: AddrMode },
+    LdrFpLiteral { size: u8, vt: u8, offset: i64 },
     StrFp { size: u8, vt: u8, rn: Reg, mode: AddrMode },
     LdpFp { size: u8, vt: u8, vt2: u8, rn: Reg, mode: AddrMode },
     StpFp { size: u8, vt: u8, vt2: u8, rn: Reg, mode: AddrMode },
+    SimdLdStSingle {
+        q: bool,
+        is_load: bool,
+        replicate: bool,
+        post_index: bool,
+        eb: u8,
+        selem: u8,
+        index: u8,
+        rm: Reg,
+        rn: Reg,
+        vt: u8,
+    },
+    SimdLdStMulti {
+        q: bool,
+        is_load: bool,
+        post_index: bool,
+        eb: u8,
+        rpt: u8,
+        selem: u8,
+        rm: Reg,
+        rn: Reg,
+        vt: u8,
+    },
     SimdMov { q: bool, vd: u8, vn: u8 },
+    SimdMovi { q: bool, op: u8, cmode: u8, imm8: u8, vd: u8 },
     SimdBitwise { q: bool, op: u8, vd: u8, vn: u8, vm: u8 },
     SimdAddSub { q: bool, esize: u8, is_sub: bool, vd: u8, vn: u8, vm: u8 },
+    SimdThreeSame { q: bool, u: bool, size: u8, opcode: u8, vd: u8, vn: u8, vm: u8 },
+    SimdShiftImm { q: bool, u: bool, immh: u8, immb: u8, opcode: u8, vd: u8, vn: u8 },
+    SimdAcross { q: bool, u: bool, size: u8, opcode: u8, vd: u8, vn: u8 },
+    SimdTwoRegMisc { q: bool, u: bool, size: u8, opcode: u8, vd: u8, vn: u8 },
     SimdDup { q: bool, esize: u8, vd: u8, rn: Reg },
+    SimdDupElem { q: bool, imm5: u8, vd: u8, vn: u8 },
+    SimdScalarDupElem { imm5: u8, vd: u8, vn: u8 },
+    SimdUmov { q: bool, imm5: u8, signed: bool, rd: Reg, vn: u8 },
+    SimdInsGpr { imm5: u8, vd: u8, rn: Reg },
+    SimdInsElem { imm5: u8, imm4: u8, vd: u8, vn: u8 },
+    SimdExt { q: bool, imm4: u8, vd: u8, vn: u8, vm: u8 },
+    SimdTbl { q: bool, is_tbx: bool, len: u8, vd: u8, vn: u8, vm: u8 },
+    SimdPermute { q: bool, size: u8, op: u8, vd: u8, vn: u8, vm: u8 },
+    SimdElemMul { q: bool, u: bool, size: u8, l: bool, m: bool, h: bool, rm: u8, opcode: u8, vd: u8, vn: u8 },
+    SimdScalarAddp { vd: u8, vn: u8 },
+    SimdScalarTwoRegMisc { u: bool, size: u8, opcode: u8, vd: u8, vn: u8 },
+    CryptoAes { op: u8, vd: u8, vn: u8 },
+    CryptoSha2 { op: u8, vd: u8, vn: u8 },
+    CryptoSha3 { op: u8, vd: u8, vn: u8, vm: u8 },
+    SimdPmull { q: bool, size: u8, vd: u8, vn: u8, vm: u8 },
+    SimdThreeDiff { q: bool, u: bool, size: u8, opcode: u8, vd: u8, vn: u8, vm: u8 },
+    CryptoEor3 { bcax: bool, vd: u8, vn: u8, vm: u8, va: u8 },
+    CryptoRax1 { vd: u8, vn: u8, vm: u8 },
+    CryptoXar { imm6: u8, vd: u8, vn: u8, vm: u8 },
 
     /// Unrecognized raw 32-bit instruction word.
     Unknown(u32),

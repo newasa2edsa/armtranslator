@@ -1,5 +1,9 @@
-use armt_apple::{decompress_payload, parse_adt, parse_img4_or_im4p, parse_macho};
+use armt_apple::{
+    decompress_payload, finalize_adt_for_xnu, parse_adt, parse_img4_or_im4p, parse_macho,
+    serialize_adt,
+};
 use armt_core::isa::{Condition, Reg, ShiftType, SysReg, Width};
+use armt_core::boot::XNU_BOOT_LINE_LENGTH;
 use armt_core::{AdtNode, ArmtError, CpuState, GuestMemory, Result, XnuBootArgs, XnuVideo};
 use armt_decoder::asm;
 use armt_hw::{Vma2Bus, Vma2MemMap};
@@ -26,6 +30,13 @@ pub fn unwrap_apple_payload(bytes: &[u8]) -> Result<Vec<u8>> {
     decompress_payload(&raw)
 }
 
+/// Optional ramdisk and static trustcache blobs to attach alongside the Apple kernel.
+#[derive(Debug, Clone, Default)]
+pub struct AppleLoadOptions {
+    pub ramdisk_bytes: Option<Vec<u8>>,
+    pub trustcache_bytes: Option<Vec<u8>>,
+}
+
 /// Load a real Apple `kernelcache.release.vma2` and `DeviceTree.vma2macosap.im4p` into `Vma2Bus` RAM
 /// and construct authentic XNU ARM64 `boot_args` (`rev=2, ver=2`).
 pub fn load_apple_kernel_bundle(
@@ -34,15 +45,34 @@ pub fn load_apple_kernel_bundle(
     devicetree_bytes: &[u8],
     cmdline: &str,
 ) -> Result<LoadedImage> {
-    let dt_raw = unwrap_apple_payload(devicetree_bytes)?;
-    let adt = parse_adt(&dt_raw)?;
+    load_apple_kernel_bundle_with_options(
+        bus,
+        kernel_bytes,
+        devicetree_bytes,
+        cmdline,
+        &AppleLoadOptions::default(),
+    )
+}
+
+/// Load an Apple kernelcache + DeviceTree with optional `RestoreRamDisk` (`rd=md0`) and `TrustCache`.
+pub fn load_apple_kernel_bundle_with_options(
+    bus: &mut Vma2Bus,
+    kernel_bytes: &[u8],
+    devicetree_bytes: &[u8],
+    cmdline: &str,
+    opts: &AppleLoadOptions,
+) -> Result<LoadedImage> {
+    let mut dt_raw = unwrap_apple_payload(devicetree_bytes)?;
+    let _ = finalize_adt_for_xnu(&mut dt_raw)?;
+    let mut adt = parse_adt(&dt_raw)?;
     bus.memmap = Vma2MemMap::from_adt(&adt, bus.memmap.ram_size / (1024 * 1024));
 
     let kc_raw = unwrap_apple_payload(kernel_bytes)?;
     let macho = parse_macho(&kc_raw)?;
 
     let ram_base = bus.memmap.ram_base;
-    let ram_end = ram_base + bus.memmap.ram_size;
+    let ram_size = bus.memmap.ram_size;
+    let ram_end = ram_base + ram_size;
 
     let min_vmaddr = macho
         .min_vmaddr()
@@ -51,7 +81,15 @@ pub fn load_apple_kernel_bundle(
         .entry_pc
         .ok_or_else(|| ArmtError::Vm("Apple kernelcache missing LC_UNIXTHREAD entry_pc".into()))?;
 
-    let kernel_load_phys = ram_base + 0x0010_0000; // 1 MiB into guest RAM
+    // Align virt_base to a 32 MiB (16 KB granule L2 block) boundary so XNU's early
+    // bootstrap L2 block page tables map (virt_base -> phys_base) with exact 32 MiB
+    // congruence. Keep at least 2 MiB below the first kernel segment for boot_args.
+    const L2_BLOCK_SIZE: u64 = 32 * 1024 * 1024;
+    let mut virt_base = min_vmaddr & !(L2_BLOCK_SIZE - 1);
+    if min_vmaddr.saturating_sub(virt_base) < 0x0020_0000 {
+        virt_base = virt_base.saturating_sub(L2_BLOCK_SIZE);
+    }
+    let kernel_load_phys = ram_base.wrapping_add(min_vmaddr.wrapping_sub(virt_base));
     let mut loaded_segs = 0usize;
     let mut highest_phys = kernel_load_phys;
 
@@ -78,21 +116,178 @@ pub fn load_apple_kernel_bundle(
         }
     }
 
-    // Align top_of_kernel_data to 16 KB (Apple Silicon page granule)
+    // Align DeviceTree placement to 16 KB (Apple Silicon page granule) and patch /chosen
+    // with the AVPBooter / iBoot runtime properties XNU's arm_init expects.
     let align_16k = 16 * 1024u64;
     let dt_phys = (highest_phys + align_16k - 1) & !(align_16k - 1);
-    if dt_phys + (dt_raw.len() as u64) <= ram_end {
-        bus.write_bytes(dt_phys, &dt_raw)?;
-    }
-    let top_of_kernel_data = (dt_phys + dt_raw.len() as u64 + align_16k - 1) & !(align_16k - 1);
-
     let boot_args_phys = ram_base + 0x4000;
+
+    if let Some(chosen) = adt.find_path_mut("chosen") {
+        chosen.set_prop("dram-base", ram_base.to_le_bytes().to_vec());
+        chosen.set_prop("dram-size", ram_size.to_le_bytes().to_vec());
+        let mut seed = Vec::with_capacity(256);
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..32 {
+            s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            seed.extend_from_slice(&(z ^ (z >> 31)).to_le_bytes());
+        }
+        chosen.set_prop("random-seed", seed);
+        chosen.set_prop("firmware-version", b"iBoot-10151.1.1\0".to_vec());
+        chosen.set_prop("effective-production-status-ap", 1u32.to_le_bytes().to_vec());
+        chosen.set_prop("effective-security-mode-ap", 1u32.to_le_bytes().to_vec());
+        chosen.set_prop("security-domain", 1u32.to_le_bytes().to_vec());
+        chosen.set_prop("debug-enabled", 1u32.to_le_bytes().to_vec());
+
+        // Populate NVRAMv3 bank geometry and proxy bank with valid CHRP partition headers
+        // and Adler-32 payload checksum so IONVRAM initializes cleanly.
+        let nvram_bank_size: u32 = 0x1_0000;
+        let nvram_bank_count: u32 = 1;
+        let mut nvram_bank = vec![0u8; nvram_bank_size as usize];
+        let chrp_checksum = |hdr: &[u8]| -> u8 {
+            let mut sum: u32 = (hdr[0] as u32) + hdr[2..16].iter().map(|&b| b as u32).sum::<u32>();
+            while sum > 0xFF {
+                sum = (sum & 0xFF) + (sum >> 8);
+            }
+            sum as u8
+        };
+        // Entry 0 (0x0000..0x0020): 2 blocks (32 bytes), "nvram" v1 bank header + Adler32 + generation.
+        nvram_bank[0] = 0x5A;
+        nvram_bank[2..4].copy_from_slice(&2u16.to_le_bytes());
+        nvram_bank[4..9].copy_from_slice(b"nvram");
+        nvram_bank[1] = chrp_checksum(&nvram_bank[0..16]);
+        nvram_bank[20..24].copy_from_slice(&1u32.to_le_bytes());
+        // Entry 1 (0x0020..0x8000): "common" partition.
+        let common_off = 0x20usize;
+        let common_blocks = ((0x8000 - common_off) / 16) as u16;
+        nvram_bank[common_off] = 0x70;
+        nvram_bank[common_off + 2..common_off + 4].copy_from_slice(&common_blocks.to_le_bytes());
+        nvram_bank[common_off + 4..common_off + 10].copy_from_slice(b"common");
+        nvram_bank[common_off + 1] = chrp_checksum(&nvram_bank[common_off..common_off + 16]);
+        // Entry 2 (0x8000..0x10000): "system" partition.
+        let sys_off = 0x8000usize;
+        let sys_blocks = ((nvram_bank_size as usize - sys_off) / 16) as u16;
+        nvram_bank[sys_off] = 0x70;
+        nvram_bank[sys_off + 2..sys_off + 4].copy_from_slice(&sys_blocks.to_le_bytes());
+        nvram_bank[sys_off + 4..sys_off + 10].copy_from_slice(b"system");
+        nvram_bank[sys_off + 1] = chrp_checksum(&nvram_bank[sys_off..sys_off + 16]);
+        // Compute standard Adler-32 over bank[20..] into bank[16..20].
+        let mut s1: u32 = 1;
+        let mut s2: u32 = 0;
+        for &b in &nvram_bank[20..] {
+            s1 = (s1 + (b as u32)) % 65521;
+            s2 = (s2 + s1) % 65521;
+        }
+        let adler = (s2 << 16) | s1;
+        nvram_bank[16..20].copy_from_slice(&adler.to_le_bytes());
+
+        chosen.set_prop("nvram-bank-size", nvram_bank_size.to_le_bytes().to_vec());
+        chosen.set_prop("nvram-bank-count", nvram_bank_count.to_le_bytes().to_vec());
+        chosen.set_prop("nvram-current-bank", 0u32.to_le_bytes().to_vec());
+        chosen.set_prop("max-env-var-data-size", 0x800u32.to_le_bytes().to_vec());
+        chosen.set_prop("max-env-var-name-size", 0x40u32.to_le_bytes().to_vec());
+        chosen.set_prop("max-env-partition", nvram_bank_size.to_le_bytes().to_vec());
+        chosen.set_prop("nvram-proxy-data", nvram_bank);
+    }
+    if let Some(vram) = adt.find_path_mut("vram") {
+        let mut reg = Vec::with_capacity(16);
+        reg.extend_from_slice(&bus.memmap.framebuffer_base.to_le_bytes());
+        reg.extend_from_slice(&bus.memmap.framebuffer_size_bytes().to_le_bytes());
+        vram.set_prop("reg", reg);
+    }
+    if let Some(cpus) = adt.find_path_mut("cpus") {
+        cpus.children.retain(|c| c.name == "cpu0");
+    }
+    bus.gic.set_apple_timer_fiq_routing();
+    bus.virtio_blk.format_gpt_stub();
+
+    let mut data_cursor = (dt_phys + 0x10_0000).max(dt_phys + align_16k);
+    let mut effective_cmdline = cmdline.to_string();
+
+    // XNU's arm_vm_init requires TrustCache to reside below kernelcache base (< vm_kernel_base).
+    // Since `virt_base` leaves >= 2 MiB between `ram_base` (`boot_args` at +0x4000) and `kernel_load_phys`,
+    // place TrustCache right at `ram_base + 0x1_0000` when it fits before the kernel image.
+    let mut trustcache_range: Option<(u64, u64)> = None;
+    if let Some(tc_raw) = opts.trustcache_bytes.as_deref() {
+        let tc_payload = unwrap_apple_payload(tc_raw)?;
+        // XNU's kern_trustcache.c expects `/chosen/memory-map/TrustCache` to start with:
+        //   struct { uint32_t num_modules; uint32_t offsets[num_modules]; }
+        // followed by the unwrapped `rtsc` module payload(s).
+        let mut tc = Vec::with_capacity(8 + tc_payload.len());
+        tc.extend_from_slice(&1u32.to_le_bytes());
+        tc.extend_from_slice(&8u32.to_le_bytes());
+        tc.extend_from_slice(&tc_payload);
+
+        let tc_len = tc.len() as u64;
+        let low_tc_addr = ram_base + 0x1_0000;
+        let tc_addr = if low_tc_addr + tc_len <= kernel_load_phys {
+            low_tc_addr
+        } else {
+            let addr = data_cursor;
+            data_cursor = (data_cursor + tc_len + align_16k - 1) & !(align_16k - 1);
+            addr
+        };
+        if tc_addr + tc_len <= ram_end {
+            bus.write_bytes(tc_addr, &tc)?;
+            trustcache_range = Some((tc_addr, tc_len));
+        }
+    }
+
+    let mut ramdisk_range: Option<(u64, u64)> = None;
+    if let Some(rd_raw) = opts.ramdisk_bytes.as_deref() {
+        let rd = unwrap_apple_payload(rd_raw)?;
+        let rd_len = rd.len() as u64;
+        if data_cursor + rd_len > ram_end {
+            return Err(ArmtError::Vm(format!(
+                "RAMDisk ({} MiB) exceeds guest RAM; increase --ram-mb",
+                rd_len / (1024 * 1024)
+            )));
+        }
+        bus.write_bytes(data_cursor, &rd)?;
+        ramdisk_range = Some((data_cursor, rd_len));
+        data_cursor = (data_cursor + rd_len + align_16k - 1) & !(align_16k - 1);
+        if !effective_cmdline.contains("rd=") {
+            if !effective_cmdline.is_empty() {
+                effective_cmdline.push(' ');
+            }
+            effective_cmdline.push_str("rd=md0");
+        }
+    }
+
+    if let Some(mmap) = adt.find_path_mut("chosen/memory-map") {
+        if let Some((addr, len)) = ramdisk_range {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&addr.to_le_bytes());
+            v.extend_from_slice(&len.to_le_bytes());
+            mmap.set_prop("RAMDisk", v);
+        }
+        if let Some((addr, len)) = trustcache_range {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&addr.to_le_bytes());
+            v.extend_from_slice(&len.to_le_bytes());
+            mmap.set_prop("TrustCache", v);
+        }
+    }
+
+    let dt_patched = serialize_adt(&adt);
+    if dt_phys + (dt_patched.len() as u64) <= ram_end {
+        bus.write_bytes(dt_phys, &dt_patched)?;
+    }
+    let dt_end = (dt_phys + dt_patched.len() as u64 + align_16k - 1) & !(align_16k - 1);
+    let top_of_kernel_data = if ramdisk_range.is_some() || trustcache_range.is_some() {
+        data_cursor.max(dt_end)
+    } else {
+        dt_end
+    };
+
     let mut ba = XnuBootArgs {
         revision: 2,
         version: 2,
-        virt_base: min_vmaddr,
+        virt_base,
         phys_base: ram_base,
-        mem_size: bus.memmap.ram_size,
+        mem_size: ram_size,
         top_of_kernel_data,
         video: XnuVideo {
             v_base_addr: bus.memmap.framebuffer_base,
@@ -103,13 +298,13 @@ pub fn load_apple_kernel_bundle(
             v_depth: 32,
         },
         machine_type: 0,
-        device_tree_p: min_vmaddr.wrapping_add(dt_phys - kernel_load_phys),
-        device_tree_length: dt_raw.len() as u32,
-        command_line: [0u8; 608],
+        device_tree_p: virt_base.wrapping_add(dt_phys - ram_base),
+        device_tree_length: dt_patched.len() as u32,
+        command_line: [0u8; XNU_BOOT_LINE_LENGTH],
         boot_flags: 0,
-        mem_size_actual: bus.memmap.ram_size,
+        mem_size_actual: ram_size,
     };
-    ba.set_command_line(cmdline);
+    ba.set_command_line(&effective_cmdline);
     bus.write_bytes(boot_args_phys, &ba.to_bytes())?;
 
     let entry_phys = kernel_load_phys.wrapping_add(entry_va.wrapping_sub(min_vmaddr));

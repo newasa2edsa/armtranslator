@@ -13,60 +13,65 @@ This repository contains **zero Apple code, firmware, kernels, or binaries**. Ev
 ## Architecture
 
 ```text
-+----------------------------------------------------------------------+
-|  armt-cli  (CLI + minifb GUI Display Window)                         |
-+----------------------------------------------------------------------+
-|  armt-vm   (VM Orchestrator, XNU boot_args builder, Demo & Benchmarks)|
-+-----------------+-----------------+------------------+---------------+
-|   armt-decoder  |    armt-jit     |    armt-apple    |    armt-hw    |
-| AArch64 decode, | W^X x86-64 JIT, | Live Catalog XML,| VirtualMac2,1:|
-| disasm & mini   | Ref Interpreter,| HTTP-Range ZIP64,| PL011 UART,   |
-| ARM64 assembler | 4KB/16KB MMU,   | IM4P/IMG4 DER,   | GICv3, Timer, |
-| (incl. ARM64e   | x64 <-> ARM64   | LZFSE/LZSS, ADT, | VMApple AES/  |
-| PAC hints)      | ABI Bridge      | 64-bit Mach-O    | CFG/BDIF,FB   |
-+-----------------+-----------------+------------------+---------------+
-|  armt-core (Shared ISA IR, CpuState, GuestMemory/MMIO/IRQ, Boot/ABI) |
-+----------------------------------------------------------------------+
++------------------------------------------------------------------------+
+|  armt-cli  (One-Click Launch, Easy-Boot, GPU Probe & CLI Tools)        |
++------------------------------------------------------------------------+
+|  armt-gpu  (NVIDIA RTX GPU Hardware Renderer via eframe/wgpu WGSL)     |
++------------------------------------------------------------------------+
+|  armt-vm   (VM Orchestrator, VMApple PAC HVC, Real XNU Kernel Loader)    |
++-----------------+-----------------+------------------+-----------------+
+|   armt-decoder  |    armt-jit     |    armt-apple    |     armt-hw     |
+| AArch64 decode, | W^X x86-64 JIT, | Live Catalog XML,| VirtualMac2,1:  |
+| disasm & ARM64  | Ref Interpreter,| HTTP-Range ZIP64,| AppleParavirtGpu|
+| assembler (incl.| 4KB/16KB MMU,   | IM4P/IMG4 DER,   | VirtIO-GPU v2,  |
+| PAC & LDXP/STXP)| x64 <-> ARM64   | LZFSE/LZSS, ADT, | Live VirtioInput|
+|                 | ABI Bridge      | 64-bit Mach-O    | UART/GIC/Timer  |
++-----------------+-----------------+------------------+-----------------+
+|  armt-core (Shared ISA IR, CpuState, GuestMemory/MMIO/IRQ, Boot/ABI)   |
++------------------------------------------------------------------------+
 ```
 
-## Quick Start
+## Quick Start & Easy Boot
 
 ```powershell
 # Build release binary
 cargo build --release
 
-# 1. Differential JIT vs Interpreter check + MIPS benchmark
+# 0. One-click Easy-Boot RTX GUI (Real Apple VirtualMac2,1 XNU launcher)
+.\target\release\armtranslator.exe
+# or:
+.\target\release\armtranslator.exe launch
+
+# 1. Verify NVIDIA RTX adapter & run headless WGSL display shader test
+.\target\release\armtranslator.exe gpu-info --test
+
+# 2. One-command Easy-Boot real Apple VirtualMac2,1 (auto-fetches from Apple CDN & boots)
+.\target\release\armtranslator.exe easy-boot
+
+# 3. Differential JIT vs Interpreter check + MIPS benchmark
 .\target\release\armtranslator.exe bench
 
-# 2. x86-64 <-> ARM64 ABI call bridge & SVC callback demo
+# 4. x86-64 <-> ARM64 ABI call bridge & SVC callback demo
 .\target\release\armtranslator.exe abi-demo
 
-# 3. Boot built-in ARM64 diagnostic kernel (add --gui for live 1024x768 window)
+# 5. Boot built-in ARM64 self-test kernel
 .\target\release\armtranslator.exe boot --demo --mode jit
 
-# 4. Query Apple's live IPSW catalog for VirtualMac2,1
+# 6. Query Apple's live IPSW catalog & HTTP-Range extract DeviceTree + kernelcache
 .\target\release\armtranslator.exe catalog --model VirtualMac2,1
-
-# 5. Fast HTTP-Range extraction of DeviceTree + kernelcache (no 25 GB download!)
 .\target\release\armtranslator.exe fetch --model VirtualMac2,1 --boot-only --out ./ipsw_cache
-
-# 6. Inspect real Apple DeviceTree (ADT) and Mach-O kernelcache
 .\target\release\armtranslator.exe inspect .\ipsw_cache\DeviceTree.vma2macosap.im4p --dump-adt
 .\target\release\armtranslator.exe inspect .\ipsw_cache\kernelcache.release.vma2
-
-# 7. Boot real Apple XNU kernelcache + DeviceTree inside the sandboxed emulator
-.\target\release\armtranslator.exe boot --kernel .\ipsw_cache\kernelcache.release.vma2 --devicetree .\ipsw_cache\DeviceTree.vma2macosap.im4p --mode jit --max-steps 50000
 ```
 
 ## Current Capabilities & Roadmap
 
 **Implemented today:**
-- Live Apple IPSW catalog querying & HTTP-Range ZIP64 extraction of `BuildManifest.plist`, `DeviceTree.vma2macosap.im4p`, and `kernelcache.release.vma2` (plus full resumable IPSW downloads).
-- Pure-Rust IM4P/IMG4 ASN.1 DER parser, LZFSE (`bvx2`) / Apple LZSS (`complzss`) decompression, Apple Device Tree (ADT) parser, and 64-bit Mach-O / `MH_FILESET` loader.
-- AArch64 decoder (including ARMv8.3 PAC hints) + reference interpreter + native W^X x86-64 Dynarec JIT with inline bounds-checked RAM access, 4KB/16KB Stage-1 MMU, and Win64/SysV ↔ AAPCS64 ABI bridge.
-- Sandboxed `VirtualMac2,1` platform: PL011 UART, GICv3, 24 MHz Apple Generic Timer, `vmapple-cfg`, `vmapple-bdif`, `vmapple-aes`, `pvpanic-mmio`, `virtio-blk`, `virtio-input`, and `1024x768` BGRA framebuffer with optional `minifb` GUI.
+- **NVIDIA RTX Hardware Display Pipeline (`armt-gpu`)**: `eframe 0.37` + `wgpu 30` (DirectX 12 / Vulkan) with explicit discrete GPU selection, custom WGSL scanout + hardware cursor shader (`display.wgsl`), and live mouse/keyboard forwarding.
+- **VirtIO-GPU v2 & `AppleParavirtGpu` (`armt-hw`)**: Full VirtIO-GPU v2 MMIO split-virtqueue 2D scanout + cursor commands alongside paravirt 2D compositor acceleration (`0x200b_0000`).
+- **One-Click Easy-Boot & Live Apple CDN Pipeline**: Auto-queries `mesu.apple.com` and extracts `BuildManifest.plist`, `DeviceTree.vma2macosap.im4p`, and `kernelcache.release.vma2` via HTTP-Range ZIP64 (no 25 GB download required), with pure-Rust IM4P/IMG4 DER, LZFSE/LZSS, ADT, and 64-bit Mach-O/`MH_FILESET` parsing.
+- **VMApple PAC & SMCCC/PSCI Hypercalls + 16 KB MMU + AdvSIMD**: Handles `0xC100_0000..0xC100_0005` PAC HVCs, SMCCC/PSCI, 32 MiB L2-aligned macOS `boot_args` (`BOOT_LINE_LENGTH=1024`), 4 KB & Apple 16 KB `TTBR1` 48-bit page walks, `LDXP`/`STXP`/`CAS`/`DC ZVA`/`AT`, Advanced SIMD (`MOVI`, `UMINV`, `UMOV`, `DUP`, `EXT`, etc.), and MMU-aware JIT code caching.
 
-**Roadmap toward full interactive macOS desktop GUI:**
-- Full `MH_FILESET` multi-kext relocation & `TTBR1` early boot page-table handoff compatibility for latest XNU versions.
-- Complete Apple-private `S3_*` system register & `AIC`/PMGR/IODART MMIO modeling.
-- Multi-vCPU SMP execution, VirtIO-GPU 3D/Metal AIR→host shader translation, APFS/AEA disk image decryption & mounting, and full WindowServer boot.
+**Roadmap toward full unmodified Apple WindowServer desktop:**
+- Complete Apple-private `S3_*` system register, `AIC` v2, PMGR, and IODART MMIO modeling for late XNU kernel phases.
+- Multi-vCPU SMP execution, VirtIO-GPU 3D / Metal AIR→SPIR-V/DXIL host RTX shader translation, APFS/AEA root volume decryption & mounting, and full Apple `WindowServer` boot.

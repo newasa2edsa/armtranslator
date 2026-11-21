@@ -210,6 +210,40 @@ pub fn disasm(inst: &Instruction, pc: u64) -> String {
             reg_name(rt2, w, false),
             fmt_addr(rn, mode)
         ),
+        Instruction::Ldxp {
+            is_64,
+            acquire,
+            rt,
+            rt2,
+            rn,
+        } => {
+            let w = if is_64 { Width::X64 } else { Width::W32 };
+            let op = if acquire { "ldaxp" } else { "ldxp" };
+            format!(
+                "{op} {}, {}, [{}]",
+                reg_name(rt, w, false),
+                reg_name(rt2, w, false),
+                reg_name(rn, Width::X64, true)
+            )
+        }
+        Instruction::Stxp {
+            is_64,
+            release,
+            rs,
+            rt,
+            rt2,
+            rn,
+        } => {
+            let w = if is_64 { Width::X64 } else { Width::W32 };
+            let op = if release { "stlxp" } else { "stxp" };
+            format!(
+                "{op} {}, {}, {}, [{}]",
+                reg_name(rs, Width::W32, false),
+                reg_name(rt, w, false),
+                reg_name(rt2, w, false),
+                reg_name(rn, Width::X64, true)
+            )
+        }
         Instruction::Mrs { rt, sysreg } => {
             format!("mrs {}, {sysreg}", reg_name(rt, Width::X64, false))
         }

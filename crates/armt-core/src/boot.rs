@@ -12,8 +12,8 @@ pub struct XnuVideo {
     pub v_depth: u64,
 }
 
-/// Maximum boot command line length in Apple arm64 `boot_args`.
-pub const XNU_BOOT_LINE_LENGTH: usize = 608;
+/// Maximum boot command line length in Apple arm64 macOS `boot_args` (`BOOT_LINE_LENGTH = 1024`).
+pub const XNU_BOOT_LINE_LENGTH: usize = 1024;
 
 /// XNU ARM64 `boot_args` structure (`revision = 2`, `version = 2`).
 #[repr(C)]
@@ -62,9 +62,9 @@ impl XnuBootArgs {
         self.command_line[..len].copy_from_slice(&bytes[..len]);
     }
 
-    /// Serialize into standard LP64 C `struct boot_args` wire layout (736 bytes).
+    /// Serialize into standard LP64 C `struct boot_args` wire layout (1152 bytes, macOS ARM64 `BOOT_LINE_LENGTH=1024`).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(736);
+        let mut out = Vec::with_capacity(1152);
         out.extend_from_slice(&self.revision.to_le_bytes()); // +0
         out.extend_from_slice(&self.version.to_le_bytes()); // +2
         out.extend_from_slice(&0u32.to_le_bytes()); // +4 pad
@@ -82,10 +82,10 @@ impl XnuBootArgs {
         out.extend_from_slice(&0u32.to_le_bytes()); // +92 pad
         out.extend_from_slice(&self.device_tree_p.to_le_bytes()); // +96
         out.extend_from_slice(&self.device_tree_length.to_le_bytes()); // +104
-        out.extend_from_slice(&self.command_line); // +108 (608 bytes -> 716)
-        out.extend_from_slice(&0u32.to_le_bytes()); // +716 pad to 8B align
-        out.extend_from_slice(&self.boot_flags.to_le_bytes()); // +720
-        out.extend_from_slice(&self.mem_size_actual.to_le_bytes()); // +728
+        out.extend_from_slice(&self.command_line); // +108 (1024 bytes -> 1132)
+        out.extend_from_slice(&0u32.to_le_bytes()); // +1132 pad to 8B align
+        out.extend_from_slice(&self.boot_flags.to_le_bytes()); // +1136
+        out.extend_from_slice(&self.mem_size_actual.to_le_bytes()); // +1144
         out
     }
 }
@@ -212,6 +212,35 @@ impl AdtNode {
         Some(cur)
     }
 
+    /// Lookup a mutable node by slash-separated path relative to this node.
+    pub fn find_path_mut(&mut self, path: &str) -> Option<&mut AdtNode> {
+        let trimmed = path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Some(self);
+        }
+        let mut cur = self;
+        for part in trimmed.split('/') {
+            let idx = cur
+                .children
+                .iter()
+                .position(|c| c.name == part || c.name_prop() == Some(part))?;
+            cur = &mut cur.children[idx];
+        }
+        Some(cur)
+    }
+
+    /// Set an existing property's value or append a new property.
+    pub fn set_prop(&mut self, name: &str, value: Vec<u8>) {
+        if let Some(p) = self.properties.iter_mut().find(|p| p.name == name) {
+            p.value = value;
+        } else {
+            self.properties.push(AdtProperty {
+                name: name.to_string(),
+                value,
+            });
+        }
+    }
+
     pub fn name_prop(&self) -> Option<&str> {
         let bytes = self.prop("name")?;
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
@@ -241,7 +270,7 @@ mod tests {
         let mut ba = XnuBootArgs::default();
         ba.set_command_line("-v serial=3");
         let bytes = ba.to_bytes();
-        assert_eq!(bytes.len(), 736);
+        assert_eq!(bytes.len(), 1152);
         assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 2);
         assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 2);
         assert_eq!(
@@ -249,6 +278,10 @@ mod tests {
             0x8000_0000
         );
         assert_eq!(&bytes[108..119], b"-v serial=3");
+        assert_eq!(
+            u64::from_le_bytes(bytes[1144..1152].try_into().unwrap()),
+            256 * 1024 * 1024
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ members = [
     "crates/armt-apple",
     "crates/armt-hw",
     "crates/armt-vm",
+    "crates/armt-gpu",
     "crates/armt-cli",
 ]
 
@@ -25,7 +26,10 @@ clap = { version = "4", features = ["derive"] }
 aes = "0.8"
 sha1 = "0.10"
 sha2 = "0.10"
-minifb = "0.28"
+eframe = "0.37"
+wgpu = "30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
 
 armt-core = { path = "crates/armt-core" }
 armt-decoder = { path = "crates/armt-decoder" }
@@ -33,3 +37,4 @@ armt-jit = { path = "crates/armt-jit" }
 armt-apple = { path = "crates/armt-apple" }
 armt-hw = { path = "crates/armt-hw" }
 armt-vm = { path = "crates/armt-vm" }
+armt-gpu = { path = "crates/armt-gpu" }

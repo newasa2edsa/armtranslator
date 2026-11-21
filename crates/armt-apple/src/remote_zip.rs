@@ -29,7 +29,7 @@ impl RemoteZip {
     /// Open a remote ZIP/IPSW URL, inspect its EOCD/ZIP64 structures, and download the Central Directory.
     pub fn open(url: &str) -> Result<Self> {
         let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(300))
             .build();
 
         let head = agent

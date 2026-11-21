@@ -481,6 +481,81 @@ fn decode_load_store(word: u32) -> Instruction {
     let op3 = (word >> 16) & 0x3F;
     let op4 = (word >> 10) & 0x3;
 
+    // 0. Advanced SIMD Load/Store single structure (LD1/ST1..LD4/ST4 single lane, LD1R..LD4R)
+    if (word & 0xBF9F_0000) == 0x0D00_0000 || (word & 0xBF80_0000) == 0x0D80_0000 {
+        let q = ((word >> 30) & 1) == 1;
+        let post_index = ((word >> 23) & 1) == 1;
+        let is_load = ((word >> 22) & 1) == 1;
+        let r_bit = ((word >> 21) & 1) as u8;
+        let rm = Reg(((word >> 16) & 0x1F) as u8);
+        let opcode = ((word >> 13) & 0x7) as u8;
+        let s_bit = ((word >> 12) & 1) as u8;
+        let size = ((word >> 10) & 0x3) as u8;
+        let rn = Reg(((word >> 5) & 0x1F) as u8);
+        let vt = (word & 0x1F) as u8;
+        let selem = (((opcode & 1) << 1) | r_bit) + 1;
+        let replicate = (opcode >> 1) == 3;
+        if replicate && !is_load {
+            return Instruction::Unknown(word);
+        }
+        let (eb, index) = if replicate {
+            (1u8 << size, 0u8)
+        } else {
+            match opcode >> 1 {
+                0 => (1u8, ((q as u8) << 3) | (s_bit << 2) | size),
+                1 => (2u8, ((q as u8) << 2) | (s_bit << 1) | (size >> 1)),
+                2 if (size & 1) == 0 => (4u8, ((q as u8) << 1) | s_bit),
+                2 if size == 1 => (8u8, q as u8),
+                _ => return Instruction::Unknown(word),
+            }
+        };
+        return Instruction::SimdLdStSingle {
+            q,
+            is_load,
+            replicate,
+            post_index,
+            eb,
+            selem,
+            index,
+            rm,
+            rn,
+            vt,
+        };
+    }
+
+    // 0b. Advanced SIMD Load/Store multiple structures (LD1..LD4 / ST1..ST4)
+    if (word & 0xBFBF_0000) == 0x0C00_0000 || (word & 0xBFA0_0000) == 0x0C80_0000 {
+        let q = ((word >> 30) & 1) == 1;
+        let post_index = ((word >> 23) & 1) == 1;
+        let is_load = ((word >> 22) & 1) == 1;
+        let rm = Reg(((word >> 16) & 0x1F) as u8);
+        let opcode = ((word >> 12) & 0xF) as u8;
+        let size = ((word >> 10) & 0x3) as u8;
+        let rn = Reg(((word >> 5) & 0x1F) as u8);
+        let vt = (word & 0x1F) as u8;
+        let (rpt, selem) = match opcode {
+            0b0111 => (1u8, 1u8),
+            0b1010 => (2u8, 1u8),
+            0b0110 => (3u8, 1u8),
+            0b0010 => (4u8, 1u8),
+            0b1000 => (1u8, 2u8),
+            0b0100 => (1u8, 3u8),
+            0b0000 => (1u8, 4u8),
+            _ => return Instruction::Unknown(word),
+        };
+        return Instruction::SimdLdStMulti {
+            q,
+            is_load,
+            post_index,
+            eb: 1u8 << size,
+            rpt,
+            selem,
+            rm,
+            rn,
+            vt,
+        };
+    }
+
     // 1. Load/Store Exclusive / Ordered / CAS: op0[1:0]==00 && op1==0 && op2[1]==0
     if (word & 0x3F00_0000) == 0x0800_0000 {
         let size = ((word >> 30) & 0x3) as u8;
@@ -489,6 +564,7 @@ fn decode_load_store(word: u32) -> Instruction {
         let o1 = (word >> 21) & 1;
         let rs = Reg(((word >> 16) & 0x1F) as u8);
         let o0 = (word >> 15) & 1;
+        let rt2 = Reg(((word >> 10) & 0x1F) as u8);
         let rn = Reg(((word >> 5) & 0x1F) as u8);
         let rt = Reg((word & 0x1F) as u8);
 
@@ -506,10 +582,33 @@ fn decode_load_store(word: u32) -> Instruction {
                 rt,
                 rn,
             },
+            (0, 1, 1, _) if size >= 2 => Instruction::Ldxp {
+                is_64: size == 3,
+                acquire: o0 == 1,
+                rt,
+                rt2,
+                rn,
+            },
+            (0, 0, 1, _) if size >= 2 => Instruction::Stxp {
+                is_64: size == 3,
+                release: o0 == 1,
+                rs,
+                rt,
+                rt2,
+                rn,
+            },
             (1, 1, 0, 1) => Instruction::Ldar { size, rt, rn },
             (1, 0, 0, 1) => Instruction::Stlr { size, rt, rn },
-            (0, _, 1, _) => Instruction::Cas {
+            (1, _, 1, _) => Instruction::Cas {
                 size,
+                acquire: l == 1,
+                release: o0 == 1,
+                rs,
+                rt,
+                rn,
+            },
+            (0, _, 1, _) if size <= 1 && rt2.0 == 31 => Instruction::Casp {
+                is_64: size == 1,
                 acquire: l == 1,
                 release: o0 == 1,
                 rs,
@@ -549,15 +648,17 @@ fn decode_load_store(word: u32) -> Instruction {
                 _ => Instruction::Unknown(word),
             };
         } else {
-            // FP literal load (ignore or treat as Unknown if unsupported)
             let fp_size = match opc {
                 0 => 4u8,
                 1 => 8u8,
                 2 => 16u8,
                 _ => return Instruction::Unknown(word),
             };
-            let _ = fp_size;
-            return Instruction::Unknown(word);
+            return Instruction::LdrFpLiteral {
+                size: fp_size,
+                vt: rt.0,
+                offset,
+            };
         }
     }
 
@@ -691,6 +792,15 @@ fn decode_load_store(word: u32) -> Instruction {
                     rt,
                     rn,
                 },
+                1..=7 => Instruction::LseAtomic {
+                    size,
+                    op: atomic_opc as u8,
+                    acquire: a,
+                    release: r,
+                    rs,
+                    rt,
+                    rn,
+                },
                 8 => Instruction::Swp {
                     size,
                     acquire: a,
@@ -699,6 +809,7 @@ fn decode_load_store(word: u32) -> Instruction {
                     rt,
                     rn,
                 },
+                12 if a && !r && rs.0 == 31 => Instruction::Ldar { size, rt, rn }, // LDAPR
                 _ => Instruction::Unknown(word),
             };
         } else {
@@ -946,8 +1057,10 @@ fn decode_dp_reg(word: u32) -> Instruction {
             (_, 0, 0) => Instruction::Madd { w, rd, rn, rm, ra },
             (_, 0, 1) => Instruction::Msub { w, rd, rn, rm, ra },
             (1, 1, 0) => Instruction::Smaddl { rd, rn, rm, ra },
+            (1, 1, 1) => Instruction::Smsubl { rd, rn, rm, ra },
             (1, 2, 0) => Instruction::Smulh { rd, rn, rm },
             (1, 5, 0) => Instruction::Umaddl { rd, rn, rm, ra },
+            (1, 5, 1) => Instruction::Umsubl { rd, rn, rm, ra },
             (1, 6, 0) => Instruction::Umulh { rd, rn, rm },
             _ => Instruction::Unknown(word),
         };
@@ -1064,6 +1177,7 @@ fn decode_dp_reg(word: u32) -> Instruction {
                     9 => Instruction::Lsrv { w, rd, rn, rm },
                     10 => Instruction::Asrv { w, rd, rn, rm },
                     11 => Instruction::Rorv { w, rd, rn, rm },
+                    12 if sf == 1 => Instruction::Pacga { rd, rn, rm },
                     _ => Instruction::Unknown(word),
                 }
             } else {
@@ -1105,8 +1219,8 @@ fn decode_dp_reg(word: u32) -> Instruction {
 }
 
 fn decode_fp_simd(word: u32) -> Instruction {
-    // Scalar Floating-Point: bits [28:24] == 0b11110 (0x1E) and bit 21 == 1
-    if ((word >> 24) & 0x1F) == 0b11110 && ((word >> 21) & 1) == 1 {
+    // Scalar Floating-Point: bit 30 == 0, bits [28:24] == 0b11110 (0x1E), and bit 21 == 1
+    if ((word >> 30) & 1) == 0 && ((word >> 24) & 0x1F) == 0b11110 && ((word >> 21) & 1) == 1 {
         let sf = ((word >> 31) & 1) == 1;
         let ftype = (word >> 22) & 0x3;
         if ftype > 1 {
@@ -1252,6 +1366,190 @@ fn decode_fp_simd(word: u32) -> Instruction {
                 vm,
             };
         }
+
+        // Comparisons, Shifts, Min/Max, Addp & Mul
+        if matches!(
+            opcode,
+            0b00110 | 0b00111 | 0b01000 | 0b01100 | 0b01101 | 0b10001 | 0b10010 | 0b10011 | 0b10111
+        ) {
+            return Instruction::SimdThreeSame {
+                q,
+                u,
+                size,
+                opcode: opcode as u8,
+                vd,
+                vn,
+                vm,
+            };
+        }
+    }
+
+    // Advanced SIMD Vector x Indexed Element:
+    // 0 | Q[30] | U[29] | 01111[28:24] | size[23:22] | L[21] | M[20] | Rm[19:16] | opcode[15:12] | H[11] | 0[10] | Rn[9:5] | Rd[4:0]
+    if (word & 0x9F00_0400) == 0x0F00_0000 {
+        let q = ((word >> 30) & 1) == 1;
+        let u = ((word >> 29) & 1) == 1;
+        let size = ((word >> 22) & 0x3) as u8;
+        let l = ((word >> 21) & 1) == 1;
+        let m = ((word >> 20) & 1) == 1;
+        let rm = ((word >> 16) & 0xF) as u8;
+        let opcode = ((word >> 12) & 0xF) as u8;
+        let h = ((word >> 11) & 1) == 1;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        if matches!(size, 1 | 2) && matches!(opcode, 0b0000 | 0b0010 | 0b0100 | 0b0110 | 0b1000 | 0b1010) {
+            return Instruction::SimdElemMul {
+                q,
+                u,
+                size,
+                l,
+                m,
+                h,
+                rm,
+                opcode,
+                vd,
+                vn,
+            };
+        }
+    }
+
+    // Advanced SIMD Scalar Pairwise ADDP Dd, Vn.2D: 0101_1110_1111_0001_1011_10_Rn_Rd
+    if (word & 0xFFFF_FC00) == 0x5EF1_B800 {
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdScalarAddp { vd, vn };
+    }
+
+    // Advanced SIMD Across Lanes: 0 Q U 01110 size 11000 opcode[16:12] 10 Rn Rd
+    if (word & 0x9F3E_0C00) == 0x0E30_0800 {
+        let q = ((word >> 30) & 1) == 1;
+        let u = ((word >> 29) & 1) == 1;
+        let size = ((word >> 22) & 0x3) as u8;
+        let opcode = ((word >> 12) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdAcross {
+            q,
+            u,
+            size,
+            opcode,
+            vd,
+            vn,
+        };
+    }
+
+    // Advanced SIMD Two-Register Misc: 0 Q U 01110 size 10000 opcode[16:12] 10 Rn Rd
+    if (word & 0x9F3E_0C00) == 0x0E20_0800 {
+        let q = ((word >> 30) & 1) == 1;
+        let u = ((word >> 29) & 1) == 1;
+        let size = ((word >> 22) & 0x3) as u8;
+        let opcode = ((word >> 12) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdTwoRegMisc {
+            q,
+            u,
+            size,
+            opcode,
+            vd,
+            vn,
+        };
+    }
+
+    // Advanced SIMD Permute (UZP1, TRN1, ZIP1, UZP2, TRN2, ZIP2):
+    // 0 | Q[30] | 001110 | size[23:22] | 0 | Rm[20:16] | 0 | op[14:12] | 10 | Rn[9:5] | Rd[4:0]
+    if (word & 0xBF20_8C00) == 0x0E00_0800 {
+        let op = ((word >> 12) & 0x7) as u8;
+        if matches!(op, 1 | 2 | 3 | 5 | 6 | 7) {
+            let q = ((word >> 30) & 1) == 1;
+            let size = ((word >> 22) & 0x3) as u8;
+            let vm = ((word >> 16) & 0x1F) as u8;
+            let vn = ((word >> 5) & 0x1F) as u8;
+            let vd = (word & 0x1F) as u8;
+            return Instruction::SimdPermute {
+                q,
+                size,
+                op,
+                vd,
+                vn,
+                vm,
+            };
+        }
+    }
+
+    // Advanced SIMD TBL / TBX: 0 Q 0 01110 000 Rm 0 len[14:13] op[12] 00 Rn Rd
+    if (word & 0xBFE0_8C00) == 0x0E00_0000 {
+        let q = ((word >> 30) & 1) == 1;
+        let vm = ((word >> 16) & 0x1F) as u8;
+        let len = (((word >> 13) & 0x3) as u8) + 1;
+        let is_tbx = ((word >> 12) & 1) == 1;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdTbl {
+            q,
+            is_tbx,
+            len,
+            vd,
+            vn,
+            vm,
+        };
+    }
+
+    // Advanced SIMD EXT: 0 Q 1 01110 000 Rm 0 imm4 0 Rn Rd
+    if (word & 0xBFE0_8400) == 0x2E00_0000 {
+        let q = ((word >> 30) & 1) == 1;
+        let vm = ((word >> 16) & 0x1F) as u8;
+        let imm4 = ((word >> 11) & 0xF) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdExt {
+            q,
+            imm4,
+            vd,
+            vn,
+            vm,
+        };
+    }
+
+    // SIMD Copy: DUP (element), UMOV, SMOV, INS (general), INS (element)
+    if (word & 0xBFE0_FC00) == 0x0E00_0400 {
+        let q = ((word >> 30) & 1) == 1;
+        let imm5 = ((word >> 16) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdDupElem { q, imm5, vd, vn };
+    }
+    if (word & 0xBFE0_FC00) == 0x0E00_3C00 || (word & 0xBFE0_FC00) == 0x0E00_2C00 {
+        let q = ((word >> 30) & 1) == 1;
+        let signed = ((word >> 12) & 1) == 0; // 0x2C00 = SMOV, 0x3C00 = UMOV
+        let imm5 = ((word >> 16) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let rd = Reg((word & 0x1F) as u8);
+        return Instruction::SimdUmov {
+            q,
+            imm5,
+            signed,
+            rd,
+            vn,
+        };
+    }
+    if (word & 0xFFE0_FC00) == 0x4E00_1C00 {
+        let imm5 = ((word >> 16) & 0x1F) as u8;
+        let rn = Reg(((word >> 5) & 0x1F) as u8);
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdInsGpr { imm5, vd, rn };
+    }
+    if (word & 0xFFE0_8400) == 0x6E00_0400 {
+        let imm5 = ((word >> 16) & 0x1F) as u8;
+        let imm4 = ((word >> 11) & 0xF) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdInsElem {
+            imm5,
+            imm4,
+            vd,
+            vn,
+        };
     }
 
     // SIMD DUP Vd, Rn (general): 0Q00_1110_000_imm5_0000_11_Rn_Rd
@@ -1272,6 +1570,164 @@ fn decode_fp_simd(word: u32) -> Instruction {
         let rn = Reg(((word >> 5) & 0x1F) as u8);
         let vd = (word & 0x1F) as u8;
         return Instruction::SimdDup { q, esize, vd, rn };
+    }
+
+    // Advanced SIMD Modified Immediate (MOVI / MVNI / ORR imm / BIC imm / FMOV vec imm)
+    // 0 | Q[30] | op[29] | 011110000[28:19] | a:b:c[18:16] | cmode[15:12] | 01[11:10] | defgh[9:5] | Rd[4:0]
+    if (word & 0x9FF8_0C00) == 0x0F00_0400 {
+        let q = ((word >> 30) & 1) == 1;
+        let op = ((word >> 29) & 1) as u8;
+        let cmode = ((word >> 12) & 0xF) as u8;
+        let abc = ((word >> 16) & 0x7) as u8;
+        let defgh = ((word >> 5) & 0x1F) as u8;
+        let imm8 = (abc << 5) | defgh;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdMovi {
+            q,
+            op,
+            cmode,
+            imm8,
+            vd,
+        };
+    }
+
+    // Advanced SIMD Shift by Immediate (immh != 0):
+    // 0 | Q[30] | U[29] | 011110[28:23] | immh[22:19] | immb[18:16] | opcode[15:11] | 1[10] | Rn[9:5] | Rd[4:0]
+    if (word & 0x9F80_0400) == 0x0F00_0400 {
+        let immh = ((word >> 19) & 0xF) as u8;
+        if immh != 0 {
+            let q = ((word >> 30) & 1) == 1;
+            let u = ((word >> 29) & 1) == 1;
+            let immb = ((word >> 16) & 0x7) as u8;
+            let opcode = ((word >> 11) & 0x1F) as u8;
+            let vn = ((word >> 5) & 0x1F) as u8;
+            let vd = (word & 0x1F) as u8;
+            if matches!(
+                opcode,
+                0b00000 | 0b00010 | 0b00100 | 0b01000 | 0b01010 | 0b10000 | 0b10100
+            ) {
+                return Instruction::SimdShiftImm {
+                    q,
+                    u,
+                    immh,
+                    immb,
+                    opcode,
+                    vd,
+                    vn,
+                };
+            }
+        }
+    }
+
+    // Cryptographic AES: 0100_1110_0010_1000_0_op[15:12]_10_Rn_Rd (AESE/AESD/AESMC/AESIMC)
+    if (word & 0xFFFF_0C00) == 0x4E28_0800 {
+        let op = ((word >> 12) & 0xF) as u8;
+        if matches!(op, 4 | 5 | 6 | 7) {
+            let vn = ((word >> 5) & 0x1F) as u8;
+            let vd = (word & 0x1F) as u8;
+            return Instruction::CryptoAes { op, vd, vn };
+        }
+    }
+
+    // Cryptographic 2-reg SHA: 0101_1110_0010_1000_0_op[15:12]_10_Rn_Rd (SHA1H/SHA1SU1/SHA256SU0)
+    if (word & 0xFFFF_0C00) == 0x5E28_0800 {
+        let op = ((word >> 12) & 0xF) as u8;
+        if matches!(op, 0 | 1 | 2) {
+            let vn = ((word >> 5) & 0x1F) as u8;
+            let vd = (word & 0x1F) as u8;
+            return Instruction::CryptoSha2 { op, vd, vn };
+        }
+    }
+
+    // Cryptographic 3-reg SHA: 0101_1110_000_Rm_0_op[14:12]_00_Rn_Rd
+    if (word & 0xFFE0_8C00) == 0x5E00_0000 {
+        let op = ((word >> 12) & 0x7) as u8;
+        if op <= 6 {
+            let vm = ((word >> 16) & 0x1F) as u8;
+            let vn = ((word >> 5) & 0x1F) as u8;
+            let vd = (word & 0x1F) as u8;
+            return Instruction::CryptoSha3 { op, vd, vn, vm };
+        }
+    }
+
+    // Advanced SIMD Scalar Copy (DUP Bd/Hd/Sd/Dd, Vn.T[index]): 0101_1110_000_imm5_0_0000_1_Rn_Rd
+    if (word & 0xFFE0_FC00) == 0x5E00_0400 {
+        let imm5 = ((word >> 16) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdScalarDupElem { imm5, vd, vn };
+    }
+
+    // Advanced SIMD Scalar Two-Register Misc: 01 U 11110 size 10000 opcode[16:12] 10 Rn Rd
+    if (word & 0xDF3E_0C00) == 0x5E20_0800 {
+        let u = ((word >> 29) & 1) == 1;
+        let size = ((word >> 22) & 0x3) as u8;
+        let opcode = ((word >> 12) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::SimdScalarTwoRegMisc {
+            u,
+            size,
+            opcode,
+            vd,
+            vn,
+        };
+    }
+
+    // Polynomial multiply long (PMULL / PMULL2): 0 Q 0 01110 size 1 Rm 1110 00 Rn Rd
+    if (word & 0xBF20_FC00) == 0x0E20_E000 {
+        let size = ((word >> 22) & 0x3) as u8;
+        if matches!(size, 0 | 3) {
+            let q = ((word >> 30) & 1) == 1;
+            let vm = ((word >> 16) & 0x1F) as u8;
+            let vn = ((word >> 5) & 0x1F) as u8;
+            let vd = (word & 0x1F) as u8;
+            return Instruction::SimdPmull { q, size, vd, vn, vm };
+        }
+    }
+
+    // Advanced SIMD Three Different: 0 Q U 01110 size 1 Rm opcode 00 Rn Rd
+    if (word & 0x9F20_0C00) == 0x0E20_0000 {
+        let q = ((word >> 30) & 1) == 1;
+        let u = ((word >> 29) & 1) == 1;
+        let size = ((word >> 22) & 0x3) as u8;
+        let vm = ((word >> 16) & 0x1F) as u8;
+        let opcode = ((word >> 12) & 0xF) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        if size <= 2 && matches!(opcode, 0..=3 | 5 | 7 | 8 | 10 | 12) {
+            return Instruction::SimdThreeDiff { q, u, size, opcode, vd, vn, vm };
+        }
+    }
+
+    // ARMv8.2 Cryptographic SHA3 / Bitwise: EOR3 (0xCE00_0000), BCAX (0xCE20_0000),
+    // RAX1 (0xCE60_8C00), XAR (0xCE80_0000).
+    if (word & 0xFFE0_8000) == 0xCE00_0000 {
+        let vm = ((word >> 16) & 0x1F) as u8;
+        let va = ((word >> 10) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::CryptoEor3 { bcax: false, vd, vn, vm, va };
+    }
+    if (word & 0xFFE0_8000) == 0xCE20_0000 {
+        let vm = ((word >> 16) & 0x1F) as u8;
+        let va = ((word >> 10) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::CryptoEor3 { bcax: true, vd, vn, vm, va };
+    }
+    if (word & 0xFFE0_FC00) == 0xCE60_8C00 {
+        let vm = ((word >> 16) & 0x1F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::CryptoRax1 { vd, vn, vm };
+    }
+    if (word & 0xFFE0_0000) == 0xCE80_0000 {
+        let vm = ((word >> 16) & 0x1F) as u8;
+        let imm6 = ((word >> 10) & 0x3F) as u8;
+        let vn = ((word >> 5) & 0x1F) as u8;
+        let vd = (word & 0x1F) as u8;
+        return Instruction::CryptoXar { imm6, vd, vn, vm };
     }
 
     Instruction::Unknown(word)

@@ -141,6 +141,8 @@ impl MmioDevice for VmaAesDevice {
     fn read(&mut self, offset: u64, _size: u8) -> Result<u64> {
         let val = match offset {
             0x00 => self.status as u64,
+            // AppleS8000AES v2/v3 status: DPA entropy seeded & hardware ready bits [13:7]
+            0x0C => 0x3F80,
             0x20 => u64::from_le_bytes(self.data[0..8].try_into().unwrap()),
             0x28 => u64::from_le_bytes(self.data[8..16].try_into().unwrap()),
             _ => 0,

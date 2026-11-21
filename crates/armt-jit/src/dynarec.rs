@@ -68,6 +68,7 @@ pub struct JitRuntimeCtx {
     pub fault_pending: u64,
     pub fault_addr: u64,
     pub interp_fallbacks: u64,
+    pub cache_invalidate_pending: u64,
 }
 
 struct HostStateRef<'a, M: GuestMemory + SysRegBus + ?Sized> {
@@ -90,19 +91,41 @@ unsafe fn vtable_fallback<M: GuestMemory + SysRegBus + ?Sized>(
             cpu.pc = target;
             pack_exit(10, 0) // early branch exit from fallback
         }
-        Ok(StepOutcome::Hlt(imm)) => pack_exit(EXIT_HLT, imm as u32),
-        Ok(StepOutcome::Svc(imm)) => pack_exit(EXIT_SVC, imm as u32),
-        Ok(StepOutcome::Hvc(imm)) => pack_exit(EXIT_HVC, imm as u32),
-        Ok(StepOutcome::Smc(imm)) => pack_exit(EXIT_SMC, imm as u32),
-        Ok(StepOutcome::Brk(imm)) => pack_exit(EXIT_BRK, imm as u32),
-        Ok(StepOutcome::Wfi) => EXIT_WFI,
+        Ok(StepOutcome::Hlt(imm)) => {
+            cpu.pc = pc;
+            pack_exit(EXIT_HLT, imm as u32)
+        }
+        Ok(StepOutcome::Svc(imm)) => {
+            cpu.pc = pc;
+            pack_exit(EXIT_SVC, imm as u32)
+        }
+        Ok(StepOutcome::Hvc(imm)) => {
+            cpu.pc = pc;
+            pack_exit(EXIT_HVC, imm as u32)
+        }
+        Ok(StepOutcome::Smc(imm)) => {
+            cpu.pc = pc;
+            pack_exit(EXIT_SMC, imm as u32)
+        }
+        Ok(StepOutcome::Brk(imm)) => {
+            cpu.pc = pc;
+            pack_exit(EXIT_BRK, imm as u32)
+        }
+        Ok(StepOutcome::Wfi) => {
+            cpu.pc = pc;
+            EXIT_WFI
+        }
         Ok(StepOutcome::Eret) => {
-            cpu.pc = cpu.elr_el1;
+            Mmu::eret(cpu);
             EXIT_ERET
         }
-        Ok(StepOutcome::Unknown(w)) => pack_exit(EXIT_UNKNOWN, w),
+        Ok(StepOutcome::Unknown(w)) => {
+            cpu.pc = pc;
+            pack_exit(EXIT_UNKNOWN, w)
+        }
         Ok(StepOutcome::Exception { .. }) => EXIT_FAULT,
         Err(e) => {
+            cpu.pc = pc;
             host.last_error = Some(e);
             EXIT_FAULT
         }
@@ -172,8 +195,14 @@ extern "C" fn jit_fallback_helper(
         let c = &mut *ctx;
         c.interp_fallbacks += 1;
         let res = (c.fallback_vtable)(c.host_state, cpu, pc, word);
-        // Refresh cached mmu_enabled & ram_base in case MSR SCTLR_EL1 changed MMU state
-        c.mmu_enabled = if (*cpu).mmu_enabled() { 1 } else { 0 };
+        // Refresh cached mmu_enabled & invalidate JIT blocks on IC maintenance or SCTLR.M change
+        let new_mmu = if (*cpu).mmu_enabled() { 1 } else { 0 };
+        let is_ic_maint = (word & 0xFFF8_F000) == 0xD508_7000
+            && matches!((word >> 8) & 0xF, 1 | 5);
+        if new_mmu != c.mmu_enabled || is_ic_maint {
+            c.cache_invalidate_pending = 1;
+        }
+        c.mmu_enabled = new_mmu;
         res
     }
 }
@@ -232,9 +261,18 @@ pub struct JitStats {
     pub insns_executed: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BlockKey {
+    pc: u64,
+    mmu_enabled: bool,
+    ttbr0: u64,
+    ttbr1: u64,
+    el: u8,
+}
+
 /// High-speed AArch64 -> x86-64 Dynamic Binary Translator (Dynarec JIT).
 pub struct JitEngine {
-    cache: HashMap<u64, CompiledBlock>,
+    cache: HashMap<BlockKey, CompiledBlock>,
     pub stats: JitStats,
 }
 
@@ -303,6 +341,7 @@ impl JitEngine {
             fault_pending: 0,
             fault_addr: 0,
             interp_fallbacks: 0,
+            cache_invalidate_pending: 0,
         };
 
         loop {
@@ -317,15 +356,27 @@ impl JitEngine {
                 return Ok(StepOutcome::Continue);
             }
 
+            if ctx.cache_invalidate_pending != 0 {
+                self.cache.clear();
+                ctx.cache_invalidate_pending = 0;
+            }
+
             let block_pc = cpu.pc;
-            let entry_fn = if let Some(b) = self.cache.get(&block_pc) {
+            let key = BlockKey {
+                pc: block_pc,
+                mmu_enabled: cpu.mmu_enabled(),
+                ttbr0: cpu.ttbr0_el1,
+                ttbr1: cpu.ttbr1_el1,
+                el: cpu.el,
+            };
+            let entry_fn = if let Some(b) = self.cache.get(&key) {
                 self.stats.jit_hits += 1;
                 b.entry
             } else {
                 self.stats.jit_misses += 1;
                 let block = compile_block(cpu, &mut host_ref, block_pc)?;
                 let f = block.entry;
-                self.cache.insert(block_pc, block);
+                self.cache.insert(key, block);
                 self.stats.blocks_compiled += 1;
                 f
             };
@@ -415,12 +466,25 @@ fn compile_block<M: GuestMemory + SysRegBus + ?Sized>(
     emit_prologue(&mut e);
 
     let mut exit_patches = Vec::new();
-    let mut fault_patches = Vec::new();
+    let mut fault_patches: Vec<(usize, u64, usize)> = Vec::new();
     let mut cur_pc = start_pc;
     let mut compiled_insns = 0usize;
 
     for idx in 0..MAX_BLOCK_INSNS {
-        let pa = host.mmu.translate(cpu, host.mem, cur_pc, false)?;
+        let pa = match host.mmu.translate(cpu, host.mem, cur_pc, false) {
+            Ok(p) => p,
+            Err(err) => {
+                if idx == 0 {
+                    return Err(err);
+                }
+                emit_add_insn_count(&mut e, compiled_insns);
+                e.mov64_imm(Gpr::Rax, cur_pc);
+                e.mov64_mr(Gpr::R15, off_pc(), Gpr::Rax);
+                e.mov32_imm(Gpr::Rax, EXIT_CONTINUE as u32);
+                exit_patches.push(e.jmp_rel32_placeholder());
+                break;
+            }
+        };
         let word = host.mem.read_u32(pa)?;
         let inst = decode(word);
         compiled_insns = idx + 1;
@@ -449,11 +513,17 @@ fn compile_block<M: GuestMemory + SysRegBus + ?Sized>(
         }
     }
 
-    let fault_pos = e.pos();
-    for p in fault_patches {
-        e.patch_rel32(p, fault_pos);
+    for (p, fpc, done_insns) in fault_patches {
+        let fpos = e.pos();
+        e.patch_rel32(p, fpos);
+        if done_insns > 1 {
+            emit_add_insn_count(&mut e, done_insns - 1);
+        }
+        e.mov64_imm(Gpr::Rax, fpc);
+        e.mov64_mr(Gpr::R15, off_pc(), Gpr::Rax);
+        e.mov32_imm(Gpr::Rax, EXIT_FAULT as u32);
+        exit_patches.push(e.jmp_rel32_placeholder());
     }
-    e.mov32_imm(Gpr::Rax, EXIT_FAULT as u32);
 
     let epilogue_pos = e.pos();
     for p in exit_patches {
@@ -742,7 +812,9 @@ fn emit_fast_or_slow_read(
     addr_reg: Gpr, // must be R12 or Rsi (preserved across helper checks; we use R12!)
     size_bytes: u8,
     out_reg: Gpr,
-    fault_patches: &mut Vec<usize>,
+    pc: u64,
+    insns_so_far: usize,
+    fault_patches: &mut Vec<(usize, u64, usize)>,
 ) {
     // Check mmu_enabled == 0
     let mmu_off = offset_of!(JitRuntimeCtx, mmu_enabled) as i32;
@@ -783,7 +855,7 @@ fn emit_fast_or_slow_read(
     let f_off = offset_of!(JitRuntimeCtx, fault_pending) as i32;
     e.mov64_rm(Gpr::Rcx, Gpr::R14, f_off);
     e.alu64_rr(0x85, Gpr::Rcx, Gpr::Rcx);
-    fault_patches.push(e.jcc_rel32_placeholder(X64Cc::Ne));
+    fault_patches.push((e.jcc_rel32_placeholder(X64Cc::Ne), pc, insns_so_far));
 
     let done_pos = e.pos();
     e.patch_rel32(done, done_pos);
@@ -794,7 +866,9 @@ fn emit_fast_or_slow_write(
     addr_reg: Gpr, // R12
     val_reg: Gpr,  // R13
     size_bytes: u8,
-    fault_patches: &mut Vec<usize>,
+    pc: u64,
+    insns_so_far: usize,
+    fault_patches: &mut Vec<(usize, u64, usize)>,
 ) {
     let mmu_off = offset_of!(JitRuntimeCtx, mmu_enabled) as i32;
     e.mov64_rm(Gpr::Rax, Gpr::R14, mmu_off);
@@ -832,7 +906,7 @@ fn emit_fast_or_slow_write(
     let f_off = offset_of!(JitRuntimeCtx, fault_pending) as i32;
     e.mov64_rm(Gpr::Rcx, Gpr::R14, f_off);
     e.alu64_rr(0x85, Gpr::Rcx, Gpr::Rcx);
-    fault_patches.push(e.jcc_rel32_placeholder(X64Cc::Ne));
+    fault_patches.push((e.jcc_rel32_placeholder(X64Cc::Ne), pc, insns_so_far));
 
     let done_pos = e.pos();
     e.patch_rel32(done, done_pos);
@@ -846,7 +920,7 @@ fn emit_instruction(
     inst: &Instruction,
     insns_so_far: usize,
     exit_patches: &mut Vec<usize>,
-    fault_patches: &mut Vec<usize>,
+    fault_patches: &mut Vec<(usize, u64, usize)>,
 ) -> bool {
     match *inst {
         Instruction::Nop
@@ -1211,7 +1285,7 @@ fn emit_instruction(
                 e.alu64_rr(0x01, Gpr::R12, Gpr::Rax);
             }
             let sz = if w == Width::W32 { 4 } else { 8 };
-            emit_fast_or_slow_read(e, Gpr::R12, sz, Gpr::Rax, fault_patches);
+            emit_fast_or_slow_read(e, Gpr::R12, sz, Gpr::Rax, pc, insns_so_far, fault_patches);
             emit_store_gpr(e, rt, Gpr::Rax, w, false);
             false
         }
@@ -1228,7 +1302,7 @@ fn emit_instruction(
             }
             emit_load_gpr(e, Gpr::R13, rt, w, false);
             let sz = if w == Width::W32 { 4 } else { 8 };
-            emit_fast_or_slow_write(e, Gpr::R12, Gpr::R13, sz, fault_patches);
+            emit_fast_or_slow_write(e, Gpr::R12, Gpr::R13, sz, pc, insns_so_far, fault_patches);
             false
         }
 
@@ -1342,6 +1416,21 @@ fn emit_instruction(
         }
         Instruction::Blr { rn } => {
             emit_load_gpr(e, Gpr::R12, rn, Width::X64, false);
+            // Strip PAC bits identically to Br/Ret
+            e.mov64_imm(Gpr::Rcx, 0x0000_FFFF_FFFF_FFFF);
+            e.mov64_rr(Gpr::Rdx, Gpr::R12);
+            e.shift64_imm(5, Gpr::Rdx, 55);
+            e.alu32_ri(4, Gpr::Rdx, 1);
+            let is_kern = e.jcc_rel32_placeholder(X64Cc::Ne);
+            e.alu64_rr(0x21, Gpr::R12, Gpr::Rcx);
+            let done_pac = e.jmp_rel32_placeholder();
+            let kpos = e.pos();
+            e.patch_rel32(is_kern, kpos);
+            e.mov64_imm(Gpr::Rcx, 0xFFFF_0000_0000_0000);
+            e.alu64_rr(0x09, Gpr::R12, Gpr::Rcx);
+            let dpos = e.pos();
+            e.patch_rel32(done_pac, dpos);
+
             e.mov64_imm(Gpr::Rax, pc.wrapping_add(4));
             emit_store_gpr(e, Reg::LR, Gpr::Rax, Width::X64, false);
             e.mov64_mr(Gpr::R15, off_pc(), Gpr::R12);
@@ -1381,6 +1470,16 @@ fn emit_instruction(
                     | Instruction::Brk { .. }
                     | Instruction::Hlt { .. }
                     | Instruction::Eret
+                    | Instruction::Msr {
+                        sysreg: armt_core::isa::SysReg::SCTLR_EL1
+                            | armt_core::isa::SysReg::TTBR0_EL1
+                            | armt_core::isa::SysReg::TTBR1_EL1
+                            | armt_core::isa::SysReg::TCR_EL1,
+                        ..
+                    }
+                    | Instruction::Tlbi { .. }
+                    | Instruction::Ic { .. }
+                    | Instruction::MsrImm { .. }
                     | Instruction::PacHint {
                         op: PacOp::Retaa | PacOp::Retab | PacOp::Braa | PacOp::Brab | PacOp::Blraa | PacOp::Blrab,
                         ..

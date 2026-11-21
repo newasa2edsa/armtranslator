@@ -19,7 +19,7 @@ pub struct CpuState {
     pub el: u8,
     pub sp_sel: u8,
     pub daif: u8,
-    pub _pad: u8,
+    pub pan: u8,
     pub sp_el0: u64,
     pub sp_el1: u64,
     pub sctlr_el1: u64,
@@ -39,6 +39,13 @@ pub struct CpuState {
     pub exclusive_addr: u64,
     pub exclusive_valid: u8,
     pub insn_count: u64,
+    pub par_el1: u64,
+    pub csselr_el1: u64,
+    pub contextidr_el1: u64,
+    pub amair_el1: u64,
+    pub mdscr_el1: u64,
+    pub pac_keys: [u64; 8],
+    pub pac_el0_div: u64,
 }
 
 impl Default for CpuState {
@@ -60,7 +67,7 @@ impl CpuState {
             el: 1,
             sp_sel: 1,
             daif: 0x0F,
-            _pad: 0,
+            pan: 0,
             sp_el0: 0,
             sp_el1: 0,
             sctlr_el1: 0x00C5_0838,
@@ -80,6 +87,13 @@ impl CpuState {
             exclusive_addr: 0,
             exclusive_valid: 0,
             insn_count: 0,
+            par_el1: 0,
+            csselr_el1: 0,
+            contextidr_el1: 0,
+            amair_el1: 0,
+            mdscr_el1: 0,
+            pac_keys: [0; 8],
+            pac_el0_div: 0,
         }
     }
 

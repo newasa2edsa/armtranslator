@@ -1,0 +1,15 @@
+[package]
+name = "armt-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+armt-core = { workspace = true }
+armt-hw = { workspace = true }
+armt-apple = { workspace = true }
+armt-vm = { workspace = true }
+eframe = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+bytemuck = { workspace = true }

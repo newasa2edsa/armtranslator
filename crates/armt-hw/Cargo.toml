@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 armt-core = { workspace = true }
 aes = { workspace = true }
+flate2 = { workspace = true }
+lzfse_rust = { workspace = true }
+plist = { workspace = true }

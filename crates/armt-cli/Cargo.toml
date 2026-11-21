@@ -15,5 +15,5 @@ armt-jit = { workspace = true }
 armt-apple = { workspace = true }
 armt-hw = { workspace = true }
 armt-vm = { workspace = true }
+armt-gpu = { workspace = true }
 clap = { workspace = true }
-minifb = { workspace = true }

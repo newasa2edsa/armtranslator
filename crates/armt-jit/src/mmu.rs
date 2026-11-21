@@ -7,6 +7,9 @@ struct TlbEntry {
     tag: u64,
     pa_base: u64,
     page_mask: u64,
+    ap_el0: bool,
+    ap_ro: bool,
+    level: u8,
     valid: bool,
 }
 
@@ -84,6 +87,20 @@ impl Mmu {
 
         let cached = self.tlb[tlb_idx];
         if cached.valid && cached.tag == tag && cached.page_mask == page_mask {
+            if cpu.el == 0 && !cached.ap_el0 {
+                return Err(ArmtError::MmuFault {
+                    va,
+                    iss: (if is_write { 0x4C } else { 0x0C }) + (cached.level as u32),
+                    reason: "Permission fault (EL0 access denied)".into(),
+                });
+            }
+            if is_write && cached.ap_ro {
+                return Err(ArmtError::MmuFault {
+                    va,
+                    iss: 0x4C + (cached.level as u32),
+                    reason: "Permission fault (write to read-only page)".into(),
+                });
+            }
             return Ok(cached.pa_base | (va & page_mask));
         }
 
@@ -102,16 +119,33 @@ impl Mmu {
         let num_levels = resolved_bits.div_ceil(stride).clamp(1, 4);
         let start_level = 4 - num_levels;
 
-        let mut table_addr = ttbr & 0x0000_FFFF_FFFF_F000;
         let index_mask = (1u64 << stride) - 1;
+        let start_lsb = granule_shift + (3 - start_level) * stride;
+        let start_top_bits = va_bits.saturating_sub(start_lsb).min(stride);
+        let root_table_bytes = (1u64 << start_top_bits) * 8;
+        let root_align_mask = !(root_table_bytes.max(64) - 1);
+        let mut table_addr = ttbr & 0x0000_FFFF_FFFF_FFC0 & root_align_mask;
+        let oa_mask = 0x0000_FFFF_FFFF_FFFFu64 & !page_mask;
+        let mut table_ap_ro = false;
+        let mut table_ap_deny_el0 = false;
 
         for level in start_level..=3 {
             let lsb = granule_shift + (3 - level) * stride;
-            let index = (va >> lsb) & index_mask;
+            let level_mask = if level == start_level {
+                let top_bits = va_bits.saturating_sub(lsb).min(stride);
+                if top_bits >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << top_bits) - 1
+                }
+            } else {
+                index_mask
+            };
+            let index = (va >> lsb) & level_mask;
             let desc_addr = table_addr + index * 8;
             let desc = mem.read_u64(desc_addr).map_err(|_| ArmtError::MmuFault {
                 va,
-                iss: if is_write { 0x44 } else { 0x04 },
+                iss: (if is_write { 0x44 } else { 0x04 }) + (level as u32),
                 reason: format!("Page table read fault at PA=0x{desc_addr:x}"),
             })?;
 
@@ -119,28 +153,53 @@ impl Mmu {
             if kind == 0 || (kind == 2) {
                 return Err(ArmtError::MmuFault {
                     va,
-                    iss: if is_write { 0x44 } else { 0x04 },
+                    iss: (if is_write { 0x44 } else { 0x04 }) + (level as u32),
                     reason: format!("Translation fault at level {level} (desc=0x{desc:x})"),
                 });
             }
 
             // Block descriptor (valid at level < 3 when kind == 1) or L3 Page descriptor (kind == 3)
             if (level < 3 && kind == 1) || (level == 3 && kind == 3) {
+                let ap_ro = table_ap_ro || ((desc >> 7) & 1) != 0;
+                let ap_el0 = !table_ap_deny_el0 && ((desc >> 6) & 1) != 0;
                 let block_mask = (1u64 << lsb) - 1;
-                let oa_base = desc & 0x0000_FFFF_FFFF_F000 & !block_mask;
+                let oa_base = desc & oa_mask & !block_mask;
                 let pa = oa_base | (va & block_mask);
-                let pa_page = (oa_base | (va & block_mask)) & !page_mask;
+                let pa_page = pa & !page_mask;
                 self.tlb[tlb_idx] = TlbEntry {
                     tag,
                     pa_base: pa_page,
                     page_mask,
+                    ap_el0,
+                    ap_ro,
+                    level: level as u8,
                     valid: true,
                 };
+                if cpu.el == 0 && !ap_el0 {
+                    return Err(ArmtError::MmuFault {
+                        va,
+                        iss: (if is_write { 0x4C } else { 0x0C }) + (level as u32),
+                        reason: "Permission fault (EL0 access denied)".into(),
+                    });
+                }
+                if is_write && ap_ro {
+                    return Err(ArmtError::MmuFault {
+                        va,
+                        iss: 0x4C + (level as u32),
+                        reason: "Permission fault (write to read-only page)".into(),
+                    });
+                }
                 return Ok(pa);
             }
 
-            // Table descriptor -> next level
-            table_addr = desc & 0x0000_FFFF_FFFF_F000;
+            // Table descriptor -> propagate APTable restrictions & advance
+            if ((desc >> 62) & 1) != 0 {
+                table_ap_ro = true;
+            }
+            if ((desc >> 61) & 1) != 0 {
+                table_ap_deny_el0 = true;
+            }
+            table_addr = desc & oa_mask;
         }
 
         Err(ArmtError::MmuFault {
@@ -165,17 +224,61 @@ impl Mmu {
             0x400
         };
 
+        Self::enter_el1_vector(cpu, ec, iss, far, vector_offset, is_irq);
+    }
+
+    /// Deliver an AArch64 `SVC #imm` system call into EL1 (`EC=0x15`, `ELR_EL1=PC+4`).
+    pub fn take_svc(cpu: &mut CpuState, imm: u16) {
+        let ret_pc = cpu.pc.wrapping_add(4);
+        Self::take_exception(cpu, 0x15, imm as u32, 0, false);
+        cpu.elr_el1 = ret_pc;
+    }
+
+    /// Deliver a GIC Group-0 FIQ into EL1 via `VBAR_EL1` (`+0x100` / `+0x300` / `+0x500`).
+    pub fn take_fiq(cpu: &mut CpuState) {
+        let vector_offset = if cpu.el == 1 {
+            let base = if cpu.sp_sel == 0 { 0x000u64 } else { 0x200u64 };
+            base + 0x100
+        } else {
+            0x500
+        };
+        Self::enter_el1_vector(cpu, 0, 0, 0, vector_offset, true);
+    }
+
+    fn enter_el1_vector(
+        cpu: &mut CpuState,
+        ec: u8,
+        iss: u32,
+        far: u64,
+        vector_offset: u64,
+        is_async: bool,
+    ) {
         cpu.elr_el1 = cpu.pc;
         let daif = (cpu.daif as u64) << 6;
         let el_mode = ((cpu.el as u64) << 2) | (cpu.sp_sel as u64);
-        cpu.spsr_el1 = cpu.nzcv | daif | el_mode;
-        cpu.esr_el1 = ((ec as u64) << 26) | (iss as u64);
+        cpu.spsr_el1 = cpu.nzcv | daif | el_mode | ((cpu.pan as u64) << 22);
+        let il = if is_async { 0 } else { 1u64 << 25 };
+        cpu.esr_el1 = ((ec as u64) << 26) | il | (iss as u64);
         cpu.far_el1 = far;
 
         cpu.el = 1;
         cpu.set_sp_sel(1);
         cpu.daif = 0x0F;
+        if (cpu.sctlr_el1 & (1 << 23)) == 0 {
+            cpu.pan = 1;
+        }
         cpu.pc = cpu.vbar_el1.wrapping_add(vector_offset);
+    }
+
+    /// Return from an EL1 exception via `ERET`, restoring PSTATE from `SPSR_EL1` and `PC` from `ELR_EL1`.
+    pub fn eret(cpu: &mut CpuState) {
+        let spsr = cpu.spsr_el1;
+        cpu.nzcv = spsr & 0xF000_0000;
+        cpu.daif = ((spsr >> 6) & 0xF) as u8;
+        cpu.pan = ((spsr >> 22) & 1) as u8;
+        cpu.el = ((spsr >> 2) & 0x3) as u8;
+        cpu.set_sp_sel((spsr & 0x1) as u8);
+        cpu.pc = cpu.elr_el1;
     }
 }
 
@@ -238,5 +341,69 @@ mod tests {
         let mut mmu = Mmu::new();
         let pa = mmu.translate(&cpu, &mut ram, va, false).unwrap();
         assert_eq!(pa, 0x20123);
+    }
+
+    #[test]
+    fn test_mmu_16kb_48bit_kernel_va() {
+        let mut ram = FlatRam(vec![0u8; 512 * 1024]);
+        let mut cpu = CpuState::new();
+        cpu.sctlr_el1 |= 1;
+        // T1SZ = 16 (48-bit VA), TG1 = 1 (16KB): L0 has 1 bit [47], L1 [46:36], L2 [35:25], L3 [24:14]
+        cpu.tcr_el1 = (1u64 << 30) | (16u64 << 16);
+        cpu.ttbr1_el1 = 0x10000;
+
+        let va = 0xFFFF_FE00_0700_4123u64;
+        let l0_idx = (va >> 47) & 0x1;
+        let l1_idx = (va >> 36) & 0x7FF;
+        let l2_idx = (va >> 25) & 0x7FF;
+        let l3_idx = (va >> 14) & 0x7FF;
+
+        ram.write_u64(0x10000 + l0_idx * 8, 0x14000 | 0x3).unwrap();
+        ram.write_u64(0x14000 + l1_idx * 8, 0x18000 | 0x3).unwrap();
+        ram.write_u64(0x18000 + l2_idx * 8, 0x1C000 | 0x3).unwrap();
+        ram.write_u64(0x1C000 + l3_idx * 8, 0x30000 | 0x403).unwrap();
+
+        let mut mmu = Mmu::new();
+        let pa = mmu.translate(&cpu, &mut ram, va, false).unwrap();
+        assert_eq!(pa, 0x30123);
+    }
+
+    #[test]
+    fn test_el0_svc_eret_and_ap_permissions() {
+        let mut ram = FlatRam(vec![0u8; 256 * 1024]);
+        let mut cpu = CpuState::new();
+        cpu.sctlr_el1 |= 1;
+        cpu.tcr_el1 = 28; // T0SZ=28 (36-bit VA, 4KB granule, starts at L1)
+        cpu.ttbr0_el1 = 0x10000;
+        cpu.vbar_el1 = 0xFFFF_FE00_0000_0000;
+        cpu.el = 0;
+        cpu.set_sp_sel(0);
+        cpu.sp = 0x7000_1000;
+        cpu.pc = 0x1_0000_4000;
+
+        let va_ro_user = 0x0000_0000_0000_4123u64;
+        let l1_idx = (va_ro_user >> 30) & 0x1FF;
+        let l2_idx = (va_ro_user >> 21) & 0x1FF;
+        let l3_idx = (va_ro_user >> 12) & 0x1FF;
+        ram.write_u64(0x10000 + l1_idx * 8, 0x11000 | 0x3).unwrap();
+        ram.write_u64(0x11000 + l2_idx * 8, 0x12000 | 0x3).unwrap();
+        // L3: AP[2:1] = 0b11 (RO + EL0 accessible: bits 7 and 6 set)
+        ram.write_u64(0x12000 + l3_idx * 8, 0x20000 | 0x4C3).unwrap();
+
+        let mut mmu = Mmu::new();
+        assert_eq!(mmu.translate(&cpu, &mut ram, va_ro_user, false).unwrap(), 0x20123);
+        assert!(mmu.translate(&cpu, &mut ram, va_ro_user, true).is_err());
+
+        Mmu::take_svc(&mut cpu, 0x80);
+        assert_eq!(cpu.el, 1);
+        assert_eq!(cpu.pc, 0xFFFF_FE00_0000_0400);
+        assert_eq!(cpu.elr_el1, 0x1_0000_4004);
+        assert_eq!((cpu.esr_el1 >> 26) & 0x3F, 0x15);
+        assert_eq!(cpu.esr_el1 & 0xFFFF, 0x80);
+
+        Mmu::eret(&mut cpu);
+        assert_eq!(cpu.el, 0);
+        assert_eq!(cpu.pc, 0x1_0000_4004);
+        assert_eq!(cpu.sp, 0x7000_1000);
     }
 }
