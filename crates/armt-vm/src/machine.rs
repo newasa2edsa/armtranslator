@@ -156,6 +156,24 @@ impl ArmVm {
         self.bus.uart0.tx_string()
     }
 
+    /// Deliver the highest-priority unmasked pending GIC FIQ (Group 0) or IRQ (Group 1) to EL1.
+    fn deliver_pending_interrupts(&mut self, fiq_count: &mut u64, irq_count: &mut u64) -> bool {
+        if self.cpu.vbar_el1 == 0 {
+            return false;
+        }
+        if (self.cpu.daif & 1) == 0 && self.bus.gic.pending_group(0).is_some() {
+            *fiq_count += 1;
+            Mmu::take_fiq(&mut self.cpu);
+            true
+        } else if (self.cpu.daif & 2) == 0 && self.bus.gic.pending_group(1).is_some() {
+            *irq_count += 1;
+            Mmu::take_exception(&mut self.cpu, 0, 0, 0, true);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Execute synchronously up to `config.max_steps` or halt.
     pub fn run(&mut self) -> Result<VmStats> {
         let control = VmControl {
@@ -231,16 +249,7 @@ impl ArmVm {
                     }
 
                     // Deliver pending GIC Group-0 FIQ or Group-1 IRQ into EL1 if unmasked
-                    if self.cpu.vbar_el1 != 0 {
-                        if (self.cpu.daif & 1) == 0 && self.bus.gic.pending_group(0).is_some() {
-                            fiq_count += 1;
-                            Mmu::take_fiq(&mut self.cpu);
-                        } else if (self.cpu.daif & 2) == 0 && self.bus.gic.pending_group(1).is_some()
-                        {
-                            irq_count += 1;
-                            Mmu::take_exception(&mut self.cpu, 0, 0, 0, true);
-                        }
-                    }
+                    let _ = self.deliver_pending_interrupts(&mut fiq_count, &mut irq_count);
 
                     let chunk = remaining.min(100_000);
                     let before = self.cpu.insn_count;
@@ -351,7 +360,7 @@ impl ArmVm {
                                 }
                             }
                         }
-                        Ok(StepOutcome::Eret) if self.is_apple_kernel => {
+                        Ok(StepOutcome::Eret) => {
                             let ran = (self.cpu.insn_count - before).max(1);
                             self.bus.tick(ran);
                             if !control.unlimited_steps {
@@ -602,6 +611,8 @@ impl ArmVm {
                 let mut ring: VecDeque<String> = VecDeque::with_capacity(self.trace_tail);
                 let mut last_fault: Option<(u64, u64, u32)> = None;
                 let mut repeat_faults = 0u32;
+                let mut fiq_count = 0u64;
+                let mut irq_count = 0u64;
                 for _ in 0..limit {
                     if control.stop.load(Ordering::Acquire) {
                         exit_reason = "Stopped by user".into();
@@ -610,6 +621,11 @@ impl ArmVm {
                     if control.paused.load(Ordering::Acquire) {
                         std::thread::sleep(Duration::from_millis(16));
                         continue;
+                    }
+
+                    // Deliver pending GIC Group-0 FIQ or Group-1 IRQ into EL1 if unmasked
+                    if self.deliver_pending_interrupts(&mut fiq_count, &mut irq_count) {
+                        wfi_count = 0;
                     }
 
                     if self.config.trace || self.trace_tail > 0 {
@@ -650,6 +666,7 @@ impl ArmVm {
                         | Ok(StepOutcome::Branch(_))
                         | Ok(StepOutcome::Eret) => {
                             self.bus.tick(1);
+                            wfi_count = 0;
                         }
                         Ok(StepOutcome::Hlt(imm)) => {
                             exit_reason = format!("HLT #{imm}");
@@ -686,8 +703,17 @@ impl ArmVm {
                             }
                         }
                         Ok(StepOutcome::Wfi) => {
-                            exit_reason = "WFI idle".into();
-                            break;
+                            wfi_count += 1;
+                            self.bus.tick(10_000);
+                            self.cpu.pc = self.cpu.pc.wrapping_add(4);
+                            if wfi_count > 1024 || !self.is_apple_kernel {
+                                exit_reason = "WFI idle".into();
+                                break;
+                            }
+                        }
+                        Ok(StepOutcome::Wfe) => {
+                            self.bus.tick(5_000);
+                            self.cpu.pc = self.cpu.pc.wrapping_add(4);
                         }
                         Ok(StepOutcome::Unknown(w)) => {
                             if self.is_apple_kernel && self.cpu.vbar_el1 != 0 && (self.cpu.el == 0 || (w & 0xFFFF_FFFE) == 0xE7FF_DEFE) {

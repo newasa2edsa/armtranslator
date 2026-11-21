@@ -1505,6 +1505,7 @@ fn emit_instruction(
                     | Instruction::Tlbi { .. }
                     | Instruction::Ic { .. }
                     | Instruction::MsrImm { .. }
+                    | Instruction::Hint { imm: 2 }
                     | Instruction::PacHint {
                         op: PacOp::Retaa | PacOp::Retab | PacOp::Braa | PacOp::Brab | PacOp::Blraa | PacOp::Blrab,
                         ..
