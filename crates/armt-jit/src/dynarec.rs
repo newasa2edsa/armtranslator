@@ -21,6 +21,7 @@ const EXIT_ERET: u64 = 7;
 const EXIT_UNKNOWN: u64 = 8;
 const EXIT_FAULT: u64 = 9;
 const EXIT_IRQ_YIELD: u64 = 11;
+const EXIT_WFE: u64 = 12;
 
 #[inline]
 const fn pack_exit(tag: u64, payload: u32) -> u64 {
@@ -124,6 +125,10 @@ unsafe fn vtable_fallback<M: GuestMemory + SysRegBus + ?Sized>(
         Ok(StepOutcome::Wfi) => {
             cpu.pc = pc;
             EXIT_WFI
+        }
+        Ok(StepOutcome::Wfe) => {
+            cpu.pc = pc;
+            EXIT_WFE
         }
         Ok(StepOutcome::Eret) => {
             Mmu::eret(cpu);
@@ -448,6 +453,11 @@ impl JitEngine {
                     self.stats.interp_fallbacks += ctx.interp_fallbacks;
                     self.stats.insns_executed = cpu.insn_count;
                     return Ok(StepOutcome::Wfi);
+                }
+                EXIT_WFE => {
+                    self.stats.interp_fallbacks += ctx.interp_fallbacks;
+                    self.stats.insns_executed = cpu.insn_count;
+                    return Ok(StepOutcome::Wfe);
                 }
                 EXIT_ERET => {
                     self.stats.interp_fallbacks += ctx.interp_fallbacks;

@@ -340,6 +340,17 @@ impl ArmVm {
                                 break;
                             }
                         }
+                        Ok(StepOutcome::Wfe) => {
+                            self.bus.tick(5_000);
+                            self.cpu.pc = self.cpu.pc.wrapping_add(4);
+                            let ran = (self.cpu.insn_count - before).max(1);
+                            if !control.unlimited_steps {
+                                remaining = remaining.saturating_sub(ran);
+                                if remaining == 0 {
+                                    exit_reason = format!("Reached step budget ({max_steps})");
+                                }
+                            }
+                        }
                         Ok(StepOutcome::Eret) if self.is_apple_kernel => {
                             let ran = (self.cpu.insn_count - before).max(1);
                             self.bus.tick(ran);
@@ -477,6 +488,10 @@ impl ArmVm {
                             Ok(StepOutcome::Continue)
                             | Ok(StepOutcome::Branch(_))
                             | Ok(StepOutcome::Eret) => self.bus.tick(1),
+                            Ok(StepOutcome::Wfe) => {
+                                self.cpu.pc = self.cpu.pc.wrapping_add(4);
+                                self.bus.tick(1);
+                            }
                             Err(ArmtError::MmuFault { va, iss, reason })
                                 if self.is_apple_kernel && self.cpu.vbar_el1 != 0 =>
                             {
@@ -517,7 +532,7 @@ impl ArmVm {
                         self.cpu.far_el1,
                     );
                     println!(
-                        "=== IRQ/Timer: fiqs={fiq_count} irqs={irq_count} cnt={} cntv_ctl=0x{:x} cntv_cval={} cntp_ctl=0x{:x} cntp_cval={} | {} ===",
+                        "=== IRQ/Timer: fiqs={fiq_count} irqs={irq_count} svcs={svc_count} cnt={} cntv_ctl=0x{:x} cntv_cval={} cntp_ctl=0x{:x} cntp_cval={} | {} ===",
                         self.bus.timer.counter,
                         self.bus.timer.cntv_ctl,
                         self.bus.timer.cntv_cval,
@@ -525,7 +540,16 @@ impl ArmVm {
                         self.bus.timer.cntp_cval,
                         self.bus.gic.debug_summary(),
                     );
-                    println!("=== PCIe: {} ===", self.bus.pcie.debug_summary());
+                    println!(
+                        "=== PCIe: {} | AES1_writes={} last=(0x{:x},0x{:x}) AES2_writes={} last=(0x{:x},0x{:x}) ===",
+                        self.bus.pcie.debug_summary(),
+                        self.bus.aes1.write_count,
+                        self.bus.aes1.last_write.0,
+                        self.bus.aes1.last_write.1,
+                        self.bus.aes2.write_count,
+                        self.bus.aes2.last_write.0,
+                        self.bus.aes2.last_write.1,
+                    );
                     // Walk frame-pointer chain (FP = X29) to print guest call stack
                     let mut fp = self.cpu.x[29];
                     let mut frames = Vec::new();

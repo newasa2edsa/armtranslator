@@ -16,6 +16,7 @@ pub enum StepOutcome {
     Brk(u16),
     Hlt(u16),
     Wfi,
+    Wfe,
     Eret,
     Exception { ec: u8, iss: u32, far: u64 },
     Unknown(u32),
@@ -191,6 +192,7 @@ impl Interpreter {
         inst: &Instruction,
     ) -> Result<StepOutcome> {
         match *inst {
+            Instruction::Hint { imm: 2 } => Ok(StepOutcome::Wfe),
             Instruction::Nop | Instruction::Hint { .. } | Instruction::Barrier { .. } | Instruction::Prfm => {
                 Ok(StepOutcome::Continue)
             }

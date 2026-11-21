@@ -105,6 +105,8 @@ pub struct VmaAesDevice {
     pub key: [u8; 16],
     pub data: [u8; 16],
     pub status: u32,
+    pub write_count: u64,
+    pub last_write: (u64, u64),
 }
 
 impl Default for VmaAesDevice {
@@ -119,6 +121,8 @@ impl VmaAesDevice {
             key: [0u8; 16],
             data: [0u8; 16],
             status: 1,
+            write_count: 0,
+            last_write: (0, 0),
         }
     }
 
@@ -151,6 +155,8 @@ impl MmioDevice for VmaAesDevice {
     }
 
     fn write(&mut self, offset: u64, _size: u8, val: u64) -> Result<()> {
+        self.write_count += 1;
+        self.last_write = (offset, val);
         match offset {
             0x04 => {
                 // Command: 1 = encrypt, 2 = decrypt
